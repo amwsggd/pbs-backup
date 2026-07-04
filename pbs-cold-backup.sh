@@ -7,6 +7,7 @@ S3_BUCKET="baidu-pbs"
 S3_PREFIX="pbs-cold-backup"
 S3_ENDPOINT="https://s3.openlist.example.com"
 PASSPHRASE_FILE="/etc/pbs-cold-backup/passphrase"
+PART_SIZE="1G"
 KEEP_SNAPSHOTS=7
 FULL_EVERY=7
 KEEP_CHAINS=3
@@ -16,19 +17,19 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
 }
 
-# 列出 S3 上的所有备份文件夹（即全量链根目录）
+# 列出 S3 上的所有全量链根目录
 list_s3_chains() {
     aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}/" \
         --endpoint-url="${S3_ENDPOINT}" 2>/dev/null | \
-        awk '$0 ~ /\/$/ {print $2}' | sed 's/\/$//' | sort
+        awk '/PRE/{print $2}' | sed 's/\/$//' | sort
 }
 
-# 获取当前最新的全量链文件夹
+# 获取当前最新的全量链目录
 current_s3_chain() {
     list_s3_chains | tail -n 1
 }
 
-# 删除旧的 S3 全量链文件夹，只保留最近的 KEEP_CHAINS 个
+# 删除旧的全量链目录，只保留最近的 KEEP_CHAINS 个
 cleanup_old_s3_chains() {
     log "Cleaning up old S3 chains, keeping last ${KEEP_CHAINS}"
     local chains
@@ -46,44 +47,36 @@ cleanup_old_s3_chains() {
 }
 
 # 配置 AWS CLI 以适配 Openlist 的 S3 兼容层
-# 注意：Openlist 不接受 5GB 的 multipart part，这里使用 500MB 分片
 configure_aws_cli() {
     aws configure set default.s3.max_concurrent_requests 1
-    aws configure set default.s3.multipart_threshold 500MB
-    aws configure set default.s3.multipart_chunksize 500MB
     aws configure set default.s3.addressing_style path
     aws configure set default.s3.signature_version s3
 }
 
-# 上传数据流：zfs send → zstd → gpg → aws s3 cp -
-# 使用 --expected-size 避免 Openlist 因未知大小的 multipart 流触发 NoSuchUpload
+# 上传数据流：zfs send → zstd → gpg → 按 1G 分片 → aws s3 cp -
+# 使用 split --filter，每个分片生成后直接上传，不保留本地文件
 upload_stream() {
     local snapshot="$1"
     local prev_snapshot="${2:-}"
-    local s3_key="$3"
-    local expected_size
+    local s3_subpath="$3"
 
-    # 估算预期大小：zstd + gpg 后通常比原快照略小或略大，加 20% 余量
-    expected_size=$(zfs list -p -H -o refer "${snapshot}")
-    expected_size=$((expected_size + expected_size / 5))
+    # 导出给 split --filter 的子 shell 使用
+    export S3_BUCKET S3_PREFIX S3_ENDPOINT
+    export UPLOAD_PATH="${S3_PREFIX}/${s3_subpath}"
 
     if [ -z "$prev_snapshot" ]; then
-        # 全量
         zfs send -c "$snapshot"
     else
-        # 增量
         zfs send -c -i "$prev_snapshot" "$snapshot"
     fi | zstd -3 | \
         gpg --symmetric --cipher-algo AES256 --compress-algo 0 \
             --passphrase-file "${PASSPHRASE_FILE}" --batch --yes | \
-        aws s3 cp - "s3://${S3_BUCKET}/${s3_key}" \
-            --endpoint-url="${S3_ENDPOINT}" \
-            --expected-size "${expected_size}" \
-            --cli-read-timeout 0 \
-            --cli-connect-timeout 600
+        split -b "${PART_SIZE}" -d -a 3 \
+            --filter='aws s3 cp - "s3://${S3_BUCKET}/${UPLOAD_PATH}/${FILE}.zfs.zst.gpg" --endpoint-url="${S3_ENDPOINT}"' \
+            - ""
 }
 
-# 创建本地快照前，先确保 AWS CLI 已配置为适配 Openlist 的低并发大分片模式
+# 创建本地快照前，先确保 AWS CLI 已配置
 configure_aws_cli
 
 # 创建本地快照
@@ -108,27 +101,27 @@ fi
 TIMESTAMP="${SNAP_NAME#pbs-}"
 
 if [ "$DO_FULL" -eq 1 ]; then
-    # 新全量：创建新文件夹
+    # 新全量：创建新链
     CHAIN_FOLDER="${TIMESTAMP}"
-    S3_KEY="${S3_PREFIX}/${CHAIN_FOLDER}/full.zfs.zst.gpg"
-    log "Full backup: s3://${S3_BUCKET}/${S3_KEY}"
-    upload_stream "${SNAPSHOT}" "" "${S3_KEY}"
+    S3_SUBPATH="${CHAIN_FOLDER}/full"
+    log "Full backup: s3://${S3_BUCKET}/${S3_PREFIX}/${S3_SUBPATH}/"
+    upload_stream "${SNAPSHOT}" "" "${S3_SUBPATH}"
 else
-    # 增量：放入当前最新的全量链文件夹
+    # 增量：放入当前最新的全量链
     CHAIN_FOLDER=$(current_s3_chain)
     if [ -z "$CHAIN_FOLDER" ]; then
         log "ERROR: no existing full backup chain found, cannot do incremental"
         exit 1
     fi
-    S3_KEY="${S3_PREFIX}/${CHAIN_FOLDER}/inc-${TIMESTAMP}.zfs.zst.gpg"
+    S3_SUBPATH="${CHAIN_FOLDER}/inc-${TIMESTAMP}"
     PREV_SNAP=$(echo "$ALL_SNAPS" | tail -n 2 | head -n 1)
     log "Incremental backup: ${PREV_SNAP} -> ${SNAPSHOT} into chain ${CHAIN_FOLDER}"
-    upload_stream "${SNAPSHOT}" "${PREV_SNAP}" "${S3_KEY}"
+    upload_stream "${SNAPSHOT}" "${PREV_SNAP}" "${S3_SUBPATH}"
 fi
 
-log "Uploaded: s3://${S3_BUCKET}/${S3_KEY}"
+log "Uploaded: s3://${S3_BUCKET}/${S3_PREFIX}/${S3_SUBPATH}/"
 
-# 清理旧的 S3 全量链
+# 清理旧的全量链
 cleanup_old_s3_chains
 
 # 清理本地旧快照
