@@ -48,10 +48,6 @@ cleanup_old_s3_chains() {
 # 配置 AWS CLI 以适配 Openlist 的 S3 兼容层
 # 注意：Openlist 不接受 5GB 的 multipart part，这里使用 500MB 分片
 configure_aws_cli() {
-    # 清理可能遗留的错误 max_bandwidth 配置（AWS CLI 的嵌套 s3 块格式）
-    if [ -f ~/.aws/config ]; then
-        sed -i '/^[[:space:]]*max_bandwidth[[:space:]]*=/d' ~/.aws/config
-    fi
     aws configure set default.s3.max_concurrent_requests 1
     aws configure set default.s3.multipart_threshold 500MB
     aws configure set default.s3.multipart_chunksize 500MB
