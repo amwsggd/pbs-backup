@@ -45,11 +45,31 @@ cleanup_old_s3_chains() {
     done
 }
 
+# 配置 AWS CLI 以适配 Openlist 的 S3 兼容层
+# 注意：Openlist 不接受 5GB 的 multipart part，这里使用 500MB 分片
+configure_aws_cli() {
+    # 清理可能遗留的错误 max_bandwidth 配置（AWS CLI 的嵌套 s3 块格式）
+    if [ -f ~/.aws/config ]; then
+        sed -i '/^[[:space:]]*max_bandwidth[[:space:]]*=/d' ~/.aws/config
+    fi
+    aws configure set default.s3.max_concurrent_requests 1
+    aws configure set default.s3.multipart_threshold 500MB
+    aws configure set default.s3.multipart_chunksize 500MB
+    aws configure set default.s3.addressing_style path
+    aws configure set default.s3.signature_version s3
+}
+
 # 上传数据流：zfs send → zstd → gpg → aws s3 cp -
+# 使用 --expected-size 避免 Openlist 因未知大小的 multipart 流触发 NoSuchUpload
 upload_stream() {
     local snapshot="$1"
     local prev_snapshot="${2:-}"
     local s3_key="$3"
+    local expected_size
+
+    # 估算预期大小：zstd + gpg 后通常比原快照略小或略大，加 20% 余量
+    expected_size=$(zfs list -p -H -o refer "${snapshot}")
+    expected_size=$((expected_size + expected_size / 5))
 
     if [ -z "$prev_snapshot" ]; then
         # 全量
@@ -61,8 +81,14 @@ upload_stream() {
         gpg --symmetric --cipher-algo AES256 --compress-algo 0 \
             --passphrase-file "${PASSPHRASE_FILE}" --batch --yes | \
         aws s3 cp - "s3://${S3_BUCKET}/${s3_key}" \
-            --endpoint-url="${S3_ENDPOINT}"
+            --endpoint-url="${S3_ENDPOINT}" \
+            --expected-size "${expected_size}" \
+            --cli-read-timeout 0 \
+            --cli-connect-timeout 600
 }
+
+# 创建本地快照前，先确保 AWS CLI 已配置为适配 Openlist 的低并发大分片模式
+configure_aws_cli
 
 # 创建本地快照
 SNAP_NAME="pbs-$(date +%Y%m%d-%H%M%S)"
