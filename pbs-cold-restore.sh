@@ -15,17 +15,33 @@ log() {
 
 # 列出 S3 上的所有全量链根目录
 list_s3_chains() {
-    aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}/" \
-        --endpoint-url="${S3_ENDPOINT}" 2>/dev/null | \
-        awk '/PRE/{print $2}' | sed 's/\/$//' | sort
+    aws s3api list-objects-v2 \
+        --bucket "${S3_BUCKET}" \
+        --prefix "${S3_PREFIX}/" \
+        --delimiter "/" \
+        --endpoint-url "${S3_ENDPOINT}" \
+        --query 'CommonPrefixes[].Prefix' \
+        --output json |
+        jq -r '.[]' |
+        sed "s#^${S3_PREFIX}/##" |
+        sed 's#/$##' |
+        sort
 }
 
 # 列出某个目录下的所有分片文件
 list_parts() {
     local subpath="$1"
-    aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}/${subpath}/" \
-        --endpoint-url="${S3_ENDPOINT}" 2>/dev/null | \
-        awk '{print $4}' | grep '\.zfs\.zst\.gpg$' | sort
+
+    aws s3api list-objects-v2 \
+        --bucket "${S3_BUCKET}" \
+        --prefix "${S3_PREFIX}/${subpath}/" \
+        --endpoint-url="${S3_ENDPOINT}" \
+        --query 'Contents[].Key' \
+        --output json |
+        jq -r '.[]' |
+        awk -F/ '{print $NF}' |
+        grep '\.zfs\.zst\.gpg$' |
+        sort
 }
 
 # 按顺序下载某个子路径下的所有分片，并合并到 stdout
@@ -47,9 +63,9 @@ stream_parts() {
 # 从 S3 下载分片、解密、解压并 zfs receive
 receive_from_s3() {
     local subpath="$1"
-    local receive_flags="$2"
+    local receive_flags="${2:-}"
     stream_parts "$subpath" | \
-        gpg --decrypt --passphrase-file "${PASSPHRASE_FILE}" --batch --yes | \
+        gpg --ignore-mdc-error --decrypt --passphrase-file "${PASSPHRASE_FILE}" --batch --yes | \
         zstd -d | \
         zfs receive ${receive_flags} "${DEST_ZVOL}"
 }
@@ -87,9 +103,17 @@ log "Restoring full backup from chain ${LATEST_CHAIN}"
 receive_from_s3 "${LATEST_CHAIN}/full" "-F"
 
 # 应用全量链下的所有增量目录
-INCREMENTAL_DIRS=$(aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}/${LATEST_CHAIN}/" \
-    --endpoint-url="${S3_ENDPOINT}" 2>/dev/null | \
-    awk '/PRE inc-/{print $2}' | sed 's/\/$//' | sort)
+INCREMENTAL_DIRS=$(aws s3api list-objects-v2 \
+    --bucket "${S3_BUCKET}" \
+    --prefix "${S3_PREFIX}/${LATEST_CHAIN}/" \
+    --delimiter "/" \
+    --endpoint-url="${S3_ENDPOINT}" \
+    --query 'CommonPrefixes[].Prefix' \
+    --output json |
+    jq -r '.[]' |
+    awk -F/ '{print $NF}' |
+    grep '^inc-' |
+    sort || true)
 
 if [ -n "$INCREMENTAL_DIRS" ]; then
     log "Applying incremental backups from chain ${LATEST_CHAIN}"

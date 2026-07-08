@@ -41,9 +41,17 @@ retry() {
 
 # 列出 S3 上的所有全量链根目录
 list_s3_chains() {
-    aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}/" \
-        --endpoint-url="${S3_ENDPOINT}" 2>/dev/null | \
-        awk '/PRE/{print $2}' | sed 's/\/$//' | sort
+    aws s3api list-objects-v2 \
+        --bucket "${S3_BUCKET}" \
+        --prefix "${S3_PREFIX}/" \
+        --delimiter "/" \
+        --endpoint-url "${S3_ENDPOINT}" \
+        --query 'CommonPrefixes[].Prefix' \
+        --output json |
+        jq -r '.[]' |
+        sed "s#^${S3_PREFIX}/##" |
+        sed 's#/$##' |
+        sort
 }
 
 # 获取当前最新的全量链目录
