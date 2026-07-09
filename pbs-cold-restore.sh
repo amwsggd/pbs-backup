@@ -7,10 +7,29 @@ S3_PREFIX="pbs-cold-backup"
 S3_ENDPOINT="https://s3.openlist.example.com"
 PASSPHRASE_FILE="/etc/pbs-cold-backup/passphrase"
 DEST_ZVOL="tank/pbs-restore"
+RETRY_ATTEMPTS=6
+RETRY_DELAY=5
 # =======================
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
+}
+
+retry() {
+    local max_attempts="${RETRY_ATTEMPTS}"
+    local delay="${RETRY_DELAY}"
+    local attempt=1
+    while [ "$attempt" -le "$max_attempts" ]; do
+        if "$@"; then
+            return 0
+        fi
+        log "WARN: command failed (attempt $attempt/$max_attempts), retrying in ${delay}s..."
+        sleep "$delay"
+        attempt=$((attempt + 1))
+        delay=$((delay * 2))
+    done
+    log "ERROR: command failed after $max_attempts attempts: $*"
+    return 1
 }
 
 # 列出 S3 上的所有全量链根目录
@@ -44,6 +63,29 @@ list_parts() {
         sort
 }
 
+# 下载单个分片到临时文件，成功后输出 stdout
+download_part() {
+    local subpath="$1"
+    local part="$2"
+
+    local tmp
+    tmp=$(mktemp)
+
+    # 确保异常退出时清理
+    trap 'rm -f "$tmp"' RETURN
+
+    aws s3 cp \
+        "s3://${S3_BUCKET}/${S3_PREFIX}/${subpath}/${part}" \
+        "$tmp" \
+        --endpoint-url="${S3_ENDPOINT}" \
+        --no-progress
+
+    cat "$tmp"
+
+    rm -f "$tmp"
+    trap - RETURN
+}
+
 # 按顺序下载某个子路径下的所有分片，并合并到 stdout
 stream_parts() {
     local subpath="$1"
@@ -55,8 +97,11 @@ stream_parts() {
     fi
     for part in $parts; do
         log "Downloading ${subpath}/${part}"
-        aws s3 cp "s3://${S3_BUCKET}/${S3_PREFIX}/${subpath}/${part}" - \
-            --endpoint-url="${S3_ENDPOINT}"
+
+        if ! retry download_part "${subpath}" "${part}"; then
+            log "ERROR: failed downloading ${subpath}/${part}"
+            return 1
+        fi
     done
 }
 
