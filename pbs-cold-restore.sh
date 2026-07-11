@@ -75,7 +75,7 @@ download_part() {
         --bucket "${S3_BUCKET}" \
         --key "${S3_PREFIX}/${subpath}/${part}" \
         --endpoint-url="${S3_ENDPOINT}" \
-        --outfile "$tmp" \
+        "$tmp" \
         >/dev/null
     then
         rm -f "$tmp"
