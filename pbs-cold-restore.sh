@@ -71,19 +71,20 @@ download_part() {
     local tmp
     tmp=$(mktemp)
 
-    # 确保异常退出时清理
-    trap 'rm -f "$tmp"' RETURN
-
-    aws s3 cp \
-        "s3://${S3_BUCKET}/${S3_PREFIX}/${subpath}/${part}" \
-        "$tmp" \
+    if ! aws s3api get-object \
+        --bucket "${S3_BUCKET}" \
+        --key "${S3_PREFIX}/${subpath}/${part}" \
         --endpoint-url="${S3_ENDPOINT}" \
-        --no-progress
+        --outfile "$tmp" \
+        >/dev/null
+    then
+        rm -f "$tmp"
+        return 1
+    fi
 
     cat "$tmp"
 
     rm -f "$tmp"
-    trap - RETURN
 }
 
 # 按顺序下载某个子路径下的所有分片，并合并到 stdout
