@@ -37,6 +37,10 @@ RETRY_DELAY=5
 SEVENZ="${SEVENZ:-7zz}"
 HEADER_SEED="${HEADER_SEED:-640}"   # 当前容器开销估计
 PAD_SLACK="${PAD_SLACK:-128}"       # 卷尾预留空间
+
+CLIP_NAME_FORMAT='MVI_%05d.MOV'
+COMPRESS_FILE_NAME_FORMAT='%s.7z.%05d'
+
 # =======================
 
 log() {
@@ -212,7 +216,7 @@ pack_and_upload_volumes() {
         # 分卷大小与容器开销处理
         for quota in $quotas; do
             local clip_name clip_path
-            clip_name=$(printf 'MVI_%05d.MOV' "$clip_idx")
+            clip_name=$(printf $CLIP_NAME_FORMAT "$clip_idx")
             clip_path="$stage_dir/${ENTRY_DIR}/${clip_name}"
 
             # 分卷条目参数与容量校验
@@ -243,7 +247,7 @@ pack_and_upload_volumes() {
 
         # 分卷条目参数与容量校验
         local vol_name
-        vol_name=$(printf '%s.7z.%03d' "$vol_base" "$vol_idx")
+        vol_name=$(printf $COMPRESS_FILE_NAME_FORMAT "$vol_base" "$vol_idx")
         (cd "$stage_dir" && "$SEVENZ" a -t7z -mx=0 -mhe=on -p"${WEAK_PASS}" \
             "$run_dir/$vol_name" "$ENTRY_DIR" >/dev/null)
         rm -rf "$stage_dir"
