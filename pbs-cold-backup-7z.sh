@@ -20,10 +20,10 @@ PASSPHRASE_FILE="${PASSPHRASE_FILE:-/etc/pbs-cold-backup/passphrase}"
 WEAK_PASS="${WEAK_PASS:-canon2024}"
 
 VOL_SIZE_MB="${VOL_SIZE_MB:-1024}"      # 归档参数
-CLIPS_PER_VOL="${CLIPS_PER_VOL:-5}"     # 归档参数
 # 分卷条目参数与容量校验
-CLIP_MIN_MB="${CLIP_MIN_MB:-150}"
-CLIP_MAX_MB="${CLIP_MAX_MB:-255}"
+CLIPS_PER_VOL="${CLIPS_PER_VOL:-}"      # 归档参数
+CLIP_MIN_MB="${CLIP_MIN_MB:-}"
+CLIP_MAX_MB="${CLIP_MAX_MB:-}"
 TMP_DIR="${TMP_DIR:-/tank/pbs-cold-backup-tmp}"
 ENTRY_DIR="${ENTRY_DIR:-DCIM/100CANON}" # 包内目录
 # 7z 归档流程说明
@@ -41,6 +41,20 @@ PAD_SLACK="${PAD_SLACK:-128}"       # 卷尾预留空间
 CLIP_NAME_FORMAT='MVI_%05d.MOV'
 COMPRESS_FILE_NAME_FORMAT='%s.7z.%05d'
 
+# 为归档条目生成稳定的时间戳序列
+if [ -z "$CLIPS_PER_VOL" ]; then
+    CLIPS_PER_VOL=$(( (VOL_SIZE_MB + 80) / 160 ))
+    [ "$CLIPS_PER_VOL" -lt 2 ] && CLIPS_PER_VOL=2
+    [ "$CLIPS_PER_VOL" -gt 24 ] && CLIPS_PER_VOL=24
+fi
+if [ -z "$CLIP_MIN_MB" ]; then
+    CLIP_MIN_MB=$(( VOL_SIZE_MB * 7 / (CLIPS_PER_VOL * 10) ))
+    [ "$CLIP_MIN_MB" -lt 2 ] && CLIP_MIN_MB=2
+fi
+if [ -z "$CLIP_MAX_MB" ]; then
+    CLIP_MAX_MB=$(( VOL_SIZE_MB * 13 / (CLIPS_PER_VOL * 10) ))
+    [ "$CLIP_MAX_MB" -gt 255 ] && CLIP_MAX_MB=255
+fi
 # =======================
 
 log() {
@@ -198,6 +212,7 @@ pack_and_upload_volumes() {
         log "ERROR: 片段配置无法凑出每卷 ${vol_target}B"
         return 1
     fi
+    log "Volume structure: ${CLIPS_PER_VOL} clip(s)/vol, clip range ${CLIP_MIN_MB}-${CLIP_MAX_MB}MB"
 
     local clip_idx=1 vol_idx=1 eof=0
     local stage_dir="$run_dir/stage"
