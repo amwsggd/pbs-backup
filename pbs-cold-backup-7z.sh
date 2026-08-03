@@ -19,9 +19,10 @@ PASSPHRASE_FILE="${PASSPHRASE_FILE:-/etc/pbs-cold-backup/passphrase}"
 # 7z 封装层口令，备份端和恢复端须保持一致
 WEAK_PASS="${WEAK_PASS:-canon2024}"
 
-VOL_SIZE_MB="${VOL_SIZE_MB:-1024}"      # 归档参数
-CLIP_MIN_MB="${CLIP_MIN_MB:-100}"       # 归档条目序号
-CLIP_MAX_MB="${CLIP_MAX_MB:-800}"
+VOL_SIZE_MB="${VOL_SIZE_MB:-1024}"      # 每卷目标大小:除最后一卷外所有卷字节数完全相等
+CLIPS_PER_VOL="${CLIPS_PER_VOL:-3}"     # 归档参数
+CLIP_MIN_MB="${CLIP_MIN_MB:-200}"       # 归档条目序号
+CLIP_MAX_MB="${CLIP_MAX_MB:-600}"
 TMP_DIR="${TMP_DIR:-/tank/pbs-cold-backup-tmp}"
 ENTRY_DIR="${ENTRY_DIR:-DCIM/100CANON}" # 包内目录
 # 7z 归档流程说明
@@ -135,11 +136,52 @@ estimate_stream_bytes() {
     esac
 }
 
+# 分卷大小与容器开销处理
+measure_vol_overhead() { # $1=临时父目录;echo 头部开销字节数
+    local d="$1" i
+    mkdir -p "$d/${ENTRY_DIR}"
+    for i in $(seq 1 "$CLIPS_PER_VOL"); do
+        head -c 1024 /dev/zero > "$d/${ENTRY_DIR}/$(printf 'MVI_%05d.MOV' "$i")"
+    done
+    (cd "$d" && "$SEVENZ" a -t7z -mx=0 -mhe=on -p"${WEAK_PASS}" "$d/probe.7z" "$ENTRY_DIR" >/dev/null)
+    echo $(( $(stat -c%s "$d/probe.7z") - CLIPS_PER_VOL * 1024 ))
+    rm -rf "$d"
+}
+
+# 分卷条目参数与容量校验
+gen_clip_sizes() { # $1=本卷载荷目标MB;输出空格分隔的大小列表
+    local total="$1" n="$CLIPS_PER_VOL" lo="$CLIP_MIN_MB" hi="$CLIP_MAX_MB"
+    local sum=0 i s rest remain lo2 hi2
+    for i in $(seq 1 $((n - 1))); do
+        rest=$((total - sum))
+        remain=$((n - i))
+        # 分卷条目参数与容量校验
+        lo2=$((rest - hi * remain)); [ "$lo2" -lt "$lo" ] && lo2=$lo
+        hi2=$((rest - lo * remain)); [ "$hi2" -gt "$hi" ] && hi2=$hi
+        s=$((lo2 + RANDOM % (hi2 - lo2 + 1)))
+        sum=$((sum + s))
+        printf '%d ' "$s"
+    done
+    printf '%d\n' "$((total - sum))"
+}
+
 # 分卷条目参数与容量校验
 pack_and_upload_volumes() {
     local s3_subpath="$1"
     local run_dir="$2"
     local vol_base="$3"
+
+    # 7z 归档流程说明
+    local overhead payload_mb
+    overhead=$(measure_vol_overhead "$run_dir/probe")
+    payload_mb=$(( VOL_SIZE_MB - (overhead + 1048575) / 1048576 ))
+    # 分卷条目参数与容量校验
+    if [ $((CLIP_MIN_MB * CLIPS_PER_VOL)) -gt "$payload_mb" ] || \
+       [ $((CLIP_MAX_MB * CLIPS_PER_VOL)) -lt "$payload_mb" ]; then
+        log "ERROR: 片段配置无法凑出每卷 ${payload_mb}M(需 ${CLIP_MIN_MB}*${CLIPS_PER_VOL} <= ${payload_mb} <= ${CLIP_MAX_MB}*${CLIPS_PER_VOL})"
+        return 1
+    fi
+    log "Volume container overhead: ${overhead}B, payload target: ${payload_mb}M/vol"
 
     local clip_idx=1 vol_idx=1 eof=0
     local stage_dir="$run_dir/stage"
@@ -148,12 +190,11 @@ pack_and_upload_volumes() {
         rm -rf "$stage_dir"
         mkdir -p "$stage_dir/${ENTRY_DIR}"
 
-        local vol_bytes=0
-        # 分卷条目参数与容量校验
-        while [ "$vol_bytes" -lt $((VOL_SIZE_MB * 1024 * 1024)) ]; do
-            local clip_mb=$((CLIP_MIN_MB + RANDOM % (CLIP_MAX_MB - CLIP_MIN_MB + 1)))
-            local clip_name clip_path got_bytes
-            clip_name=$(printf 'MVI_%04d.MOV' "$clip_idx")
+        local vol_bytes=0 clip_mb got_bytes
+        # 分卷大小与容器开销处理
+        for clip_mb in $(gen_clip_sizes "$payload_mb"); do
+            local clip_name clip_path
+            clip_name=$(printf 'MVI_%05d.MOV' "$clip_idx")
             clip_path="$stage_dir/${ENTRY_DIR}/${clip_name}"
 
             # 7z 归档流程说明
@@ -184,12 +225,11 @@ pack_and_upload_volumes() {
         # 分卷条目参数与容量校验
         local vol_name
         vol_name=$(printf '%s.7z.%03d' "$vol_base" "$vol_idx")
-        log "Packing volume ${vol_name} ($((vol_bytes / 1024 / 1024))M, clips so far: $((clip_idx - 1)))"
-        (cd "$stage_dir" && "$SEVENZ" a -t7z -mx=1 -mhe=on -p"${WEAK_PASS}" \
+        (cd "$stage_dir" && "$SEVENZ" a -t7z -mx=0 -mhe=on -p"${WEAK_PASS}" \
             "$run_dir/$vol_name" "$ENTRY_DIR" >/dev/null)
         rm -rf "$stage_dir"
 
-        log "Uploading ${vol_name}"
+        log "Uploading ${vol_name} ($(stat -c%s "$run_dir/$vol_name")B, $((vol_bytes / 1024 / 1024))M payload)"
         retry aws s3 cp "$run_dir/$vol_name" \
             "s3://${S3_BUCKET}/${S3_PREFIX}/${s3_subpath}/${vol_name}" \
             --endpoint-url="${S3_ENDPOINT}" \
