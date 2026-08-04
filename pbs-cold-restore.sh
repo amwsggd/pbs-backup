@@ -33,16 +33,19 @@ retry() {
 }
 
 # 列出 S3 上的所有全量链根目录
+# 链根目录:多源共用同一 S3 前缀时按 SRC_TAG 隔离(独立运行为空,布局不变)
+CHAIN_ROOT="${S3_PREFIX}${SRC_TAG:+/${SRC_TAG}}"
+
 list_s3_chains() {
     aws s3api list-objects-v2 \
         --bucket "${S3_BUCKET}" \
-        --prefix "${S3_PREFIX}/" \
+        --prefix "${CHAIN_ROOT}/" \
         --delimiter "/" \
         --endpoint-url "${S3_ENDPOINT}" \
         --query 'CommonPrefixes[].Prefix' \
         --output json |
         jq -r '.[]' |
-        sed "s#^${S3_PREFIX}/##" |
+        sed "s#^${CHAIN_ROOT}/##" |
         sed 's#/$##' |
         sort
 }
@@ -53,7 +56,7 @@ list_parts() {
 
     aws s3api list-objects-v2 \
         --bucket "${S3_BUCKET}" \
-        --prefix "${S3_PREFIX}/${subpath}/" \
+        --prefix "${CHAIN_ROOT}/${subpath}/" \
         --endpoint-url="${S3_ENDPOINT}" \
         --query 'Contents[].Key' \
         --output json |
@@ -73,7 +76,7 @@ download_part() {
 
     if ! aws s3api get-object \
         --bucket "${S3_BUCKET}" \
-        --key "${S3_PREFIX}/${subpath}/${part}" \
+        --key "${CHAIN_ROOT}/${subpath}/${part}" \
         --endpoint-url="${S3_ENDPOINT}" \
         "$tmp" \
         >/dev/null
@@ -148,15 +151,17 @@ fi
 log "Restoring full backup from chain ${LATEST_CHAIN}"
 receive_from_s3 "${LATEST_CHAIN}/full" "-F"
 
-# 应用全量链下的所有增量目录
+# 应用全量链下的所有增量目录(注意先 sed 去尾 slash 再取目录名,
+# 否则 $NF 为空导致增量被静默跳过)
 INCREMENTAL_DIRS=$(aws s3api list-objects-v2 \
     --bucket "${S3_BUCKET}" \
-    --prefix "${S3_PREFIX}/${LATEST_CHAIN}/" \
+    --prefix "${CHAIN_ROOT}/${LATEST_CHAIN}/" \
     --delimiter "/" \
     --endpoint-url="${S3_ENDPOINT}" \
     --query 'CommonPrefixes[].Prefix' \
     --output json |
     jq -r '.[]' |
+    sed 's#/$##' |
     awk -F/ '{print $NF}' |
     grep '^inc-' |
     sort || true)

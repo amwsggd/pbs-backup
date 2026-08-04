@@ -43,17 +43,20 @@ retry() {
     return 1
 }
 
+# 链根目录:多源共用同一 S3 前缀时按 SRC_TAG 隔离(独立运行为空,布局不变)
+CHAIN_ROOT="${S3_PREFIX}${SRC_TAG:+/${SRC_TAG}}"
+
 # 列出 S3 上的所有全量链根目录
 list_s3_chains() {
     aws s3api list-objects-v2 \
         --bucket "${S3_BUCKET}" \
-        --prefix "${S3_PREFIX}/" \
+        --prefix "${CHAIN_ROOT}/" \
         --delimiter "/" \
         --endpoint-url "${S3_ENDPOINT}" \
         --query 'CommonPrefixes[].Prefix' \
         --output json |
         jq -r '.[]' |
-        sed "s#^${S3_PREFIX}/##" |
+        sed "s#^${CHAIN_ROOT}/##" |
         sed 's#/$##' |
         sort
 }
@@ -64,7 +67,7 @@ list_volumes() {
 
     aws s3api list-objects-v2 \
         --bucket "${S3_BUCKET}" \
-        --prefix "${S3_PREFIX}/${subpath}/" \
+        --prefix "${CHAIN_ROOT}/${subpath}/" \
         --endpoint-url="${S3_ENDPOINT}" \
         --query 'Contents[].Key' \
         --output json |
@@ -83,7 +86,7 @@ download_volume() {
 
     aws s3api get-object \
         --bucket "${S3_BUCKET}" \
-        --key "${S3_PREFIX}/${subpath}/${part}" \
+        --key "${CHAIN_ROOT}/${subpath}/${part}" \
         --endpoint-url="${S3_ENDPOINT}" \
         "$dest" \
         >/dev/null
@@ -176,7 +179,7 @@ receive_from_s3 "${LATEST_CHAIN}/full" "-F"
 # ======= 按序应用增量 =======
 INCREMENTAL_DIRS=$(aws s3api list-objects-v2 \
     --bucket "${S3_BUCKET}" \
-    --prefix "${S3_PREFIX}/${LATEST_CHAIN}/" \
+    --prefix "${CHAIN_ROOT}/${LATEST_CHAIN}/" \
     --delimiter "/" \
     --endpoint-url="${S3_ENDPOINT}" \
     --query 'CommonPrefixes[].Prefix' \

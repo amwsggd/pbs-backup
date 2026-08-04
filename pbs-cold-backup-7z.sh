@@ -79,17 +79,17 @@ retry() {
     return 1
 }
 
-# 列出 S3 上的所有全量链根目录
+# 列出 S3 上当前链根目录下的所有全量链(CHAIN_ROOT 在主流程中赋值,含 SRC_TAG 隔离)
 list_s3_chains() {
     aws s3api list-objects-v2 \
         --bucket "${S3_BUCKET}" \
-        --prefix "${S3_PREFIX}/" \
+        --prefix "${CHAIN_ROOT}/" \
         --delimiter "/" \
         --endpoint-url "${S3_ENDPOINT}" \
         --query 'CommonPrefixes[].Prefix' \
         --output json |
         jq -r '.[]' |
-        sed "s#^${S3_PREFIX}/##" |
+        sed "s#^${CHAIN_ROOT}/##" |
         sed 's#/$##' |
         sort
 }
@@ -149,7 +149,8 @@ estimate_stream_bytes() {
     if [ -z "$prev_snapshot" ]; then
         val=$(zfs get -Hpo value referenced "$snapshot" 2>/dev/null || true)
     else
-        val=$(zfs get -Hpo value "written@${prev_snapshot#*@}" "$snapshot" 2>/dev/null || true)
+        # prev 可为快照(fs@snap)或书签(fs#bm),统一取尾段
+        val=$(zfs get -Hpo value "written@${prev_snapshot##*[@#]}" "$snapshot" 2>/dev/null || true)
     fi
     case "$val" in
         ''|*[!0-9]*) echo 0 ;;
@@ -284,7 +285,7 @@ pack_and_upload_volumes() {
 
         log "Uploading ${vol_name} ($(stat -c%s "$run_dir/$vol_name")B, $((vol_bytes / 1024 / 1024))M payload)"
         retry aws s3 cp "$run_dir/$vol_name" \
-            "s3://${S3_BUCKET}/${S3_PREFIX}/${s3_subpath}/${vol_name}" \
+            "s3://${S3_BUCKET}/${CHAIN_ROOT}/${s3_subpath}/${vol_name}" \
             --endpoint-url="${S3_ENDPOINT}" \
             --cli-read-timeout 0 \
             --cli-connect-timeout 600
@@ -304,32 +305,52 @@ mkdir -p "$TMP_DIR"
 
 configure_aws_cli
 
-# ======= 创建本地快照 =======
-SNAP_NAME="${SNAP_TAG:-pbs}-$(date +%Y%m%d-%H%M%S)"
-SNAPSHOT="${ZVOL}@${SNAP_NAME}"
-log "Creating snapshot ${SNAPSHOT}"
-zfs snapshot "${SNAPSHOT}"
-
-# 列出所有本地快照
-ALL_SNAPS=$(zfs list -t snapshot -H -o name -s creation | grep "^${ZVOL}@pbs-" || true)
-SNAP_COUNT=$(echo "$ALL_SNAPS" | grep -c "^${ZVOL}@${SNAP_TAG:-pbs}-" || true)
-
-# 判断全量还是增量
-DO_FULL=0
-if [ "$SNAP_COUNT" -le 1 ]; then
-    DO_FULL=1
-elif [ $((SNAP_COUNT % FULL_EVERY)) -eq 0 ]; then
-    DO_FULL=1
+# ======= 快照与全量/增量判断 =======
+# 两种模式:
+#  A. 独立运行(默认):自建 ${SNAP_TAG:-pbs}-<ts> 快照,按本地快照计数定全量/增量
+#  B. manager 多目标:EXISTING_SNAPSHOT 复用共享快照(不建不删) +
+#     ANCHOR_BOOKMARK_PREFIX 按"源×目标"书签定节奏/作增量锚点(send -i 支持书签)
+#     + BACKUP_TS 统一时间戳 + SRC_TAG 链目录按源隔离
+TIMESTAMP="${BACKUP_TS:-$(date +%Y%m%d-%H%M%S)}"
+if [ -n "${EXISTING_SNAPSHOT:-}" ]; then
+    SNAPSHOT="$EXISTING_SNAPSHOT"
+    log "Reusing existing snapshot ${SNAPSHOT}"
+else
+    SNAP_NAME="${SNAP_TAG:-pbs}-${TIMESTAMP}"
+    SNAPSHOT="${ZVOL}@${SNAP_NAME}"
+    log "Creating snapshot ${SNAPSHOT}"
+    zfs snapshot "${SNAPSHOT}"
 fi
 
-# 时间戳用于文件夹名和文件名
-TIMESTAMP="${SNAP_NAME#${SNAP_TAG:-pbs}-}"
+# 链根目录:多源共用同一 S3 前缀时按 SRC_TAG 隔离(独立运行为空,布局不变)
+CHAIN_ROOT="${S3_PREFIX}${SRC_TAG:+/${SRC_TAG}}"
+
+DO_FULL=0
+if [ -n "${ANCHOR_BOOKMARK_PREFIX:-}" ]; then
+    # B 模式:书签计数定节奏(0 或 FULL_EVERY 倍数→全量),最新书签为增量锚点
+    ALL_BMS=$(zfs list -t bookmark -H -o name -s creation \
+        | grep "^${ZVOL}#${ANCHOR_BOOKMARK_PREFIX}-" || true)
+    BM_COUNT=$(echo "$ALL_BMS" | grep -c "^${ZVOL}#${ANCHOR_BOOKMARK_PREFIX}-" || true)
+    [ $((BM_COUNT % FULL_EVERY)) -eq 0 ] && DO_FULL=1
+    PREV_SNAP=$(echo "$ALL_BMS" | tail -n 1)
+else
+    # A 模式:本地快照计数(原逻辑)
+    ALL_SNAPS=$(zfs list -t snapshot -H -o name -s creation \
+        | grep "^${ZVOL}@${SNAP_TAG:-pbs}-" || true)
+    SNAP_COUNT=$(echo "$ALL_SNAPS" | grep -c "^${ZVOL}@${SNAP_TAG:-pbs}-" || true)
+    if [ "$SNAP_COUNT" -le 1 ]; then
+        DO_FULL=1
+    elif [ $((SNAP_COUNT % FULL_EVERY)) -eq 0 ]; then
+        DO_FULL=1
+    fi
+    PREV_SNAP=$(echo "$ALL_SNAPS" | tail -n 2 | head -n 1)
+fi
 
 if [ "$DO_FULL" -eq 1 ]; then
     CHAIN_FOLDER="${TIMESTAMP}"
     S3_SUBPATH="${CHAIN_FOLDER}/full"
     PREV_SNAP=""
-    log "Full backup: s3://${S3_BUCKET}/${S3_PREFIX}/${S3_SUBPATH}/"
+    log "Full backup: s3://${S3_BUCKET}/${CHAIN_ROOT}/${S3_SUBPATH}/"
 else
     CHAIN_FOLDER=$(current_s3_chain)
     if [ -z "$CHAIN_FOLDER" ]; then
@@ -337,7 +358,6 @@ else
         exit 1
     fi
     S3_SUBPATH="${CHAIN_FOLDER}/inc-${TIMESTAMP}"
-    PREV_SNAP=$(echo "$ALL_SNAPS" | tail -n 2 | head -n 1)
     log "Incremental backup: ${PREV_SNAP} -> ${SNAPSHOT} into chain ${CHAIN_FOLDER}"
 fi
 
@@ -357,13 +377,22 @@ zfs_send_stream "$SNAPSHOT" "$PREV_SNAP" | \
     compress_encrypt_stream | \
     pack_and_upload_volumes "$S3_SUBPATH" "$RUN_DIR" "$VOL_BASE"
 
-log "Uploaded: s3://${S3_BUCKET}/${S3_PREFIX}/${S3_SUBPATH}/"
+log "Uploaded: s3://${S3_BUCKET}/${CHAIN_ROOT}/${S3_SUBPATH}/"
 
 # 清理旧的全量链
 cleanup_old_s3_chains
 
-# 清理本地旧快照
-log "Cleaning up local snapshots"
-echo "$ALL_SNAPS" | head -n -${KEEP_SNAPSHOTS} | xargs -r -n1 zfs destroy
+# 本地锚点维护:B 模式建"源×目标"书签并修剪(书签不占空间,快照可安全轮换);
+# A 模式且快照为自建时,按 KEEP_SNAPSHOTS 清理本地旧快照
+if [ -n "${ANCHOR_BOOKMARK_PREFIX:-}" ]; then
+    log "Creating anchor bookmark ${ZVOL}#${ANCHOR_BOOKMARK_PREFIX}-${TIMESTAMP}"
+    zfs bookmark "${SNAPSHOT}" "${ZVOL}#${ANCHOR_BOOKMARK_PREFIX}-${TIMESTAMP}"
+    zfs list -t bookmark -H -o name -s creation \
+        | grep "^${ZVOL}#${ANCHOR_BOOKMARK_PREFIX}-" \
+        | head -n -${KEEP_SNAPSHOTS} | xargs -r -n1 zfs destroy
+elif [ -z "${EXISTING_SNAPSHOT:-}" ]; then
+    log "Cleaning up local snapshots"
+    echo "$ALL_SNAPS" | head -n -${KEEP_SNAPSHOTS} | xargs -r -n1 zfs destroy
+fi
 
 log "Done"
