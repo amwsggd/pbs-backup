@@ -7,8 +7,8 @@ S3_PREFIX="${S3_PREFIX:-pbs-cold-backup}"
 S3_ENDPOINT="${S3_ENDPOINT:-https://s3.openlist.example.com}"
 PASSPHRASE_FILE="${PASSPHRASE_FILE:-/etc/pbs-cold-backup/passphrase}"
 DEST_ZVOL="${DEST_ZVOL:-tank/pbs-restore}"
-RETRY_ATTEMPTS=6
-RETRY_DELAY=5
+RETRY_ATTEMPTS="${RETRY_ATTEMPTS:-6}"
+RETRY_DELAY="${RETRY_DELAY:-5}"
 # =======================
 
 log() {

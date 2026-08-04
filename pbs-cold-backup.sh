@@ -10,11 +10,11 @@ PASSPHRASE_FILE="${PASSPHRASE_FILE:-/etc/pbs-cold-backup/passphrase}"
 PART_SIZE="${PART_SIZE:-1G}"
 PART_FORMAT="${PART_FORMAT:-x%05d.zfs.zst.gpg}"
 TMP_DIR="${TMP_DIR:-/tank/pbs-cold-backup-tmp}"
-KEEP_SNAPSHOTS=7
-FULL_EVERY=7
-KEEP_CHAINS=3
-RETRY_ATTEMPTS=3
-RETRY_DELAY=5
+KEEP_SNAPSHOTS="${KEEP_SNAPSHOTS:-7}"
+FULL_EVERY="${FULL_EVERY:-7}"
+KEEP_CHAINS="${KEEP_CHAINS:-3}"
+RETRY_ATTEMPTS="${RETRY_ATTEMPTS:-3}"
+RETRY_DELAY="${RETRY_DELAY:-5}"
 # =======================
 
 log() {
@@ -57,6 +57,19 @@ list_s3_chains() {
 # 获取当前最新的全量链目录
 current_s3_chain() {
     list_s3_chains | tail -n 1
+}
+
+# 统计某链目录下的增量(inc-*)目录数
+count_chain_incs() {
+    aws s3api list-objects-v2 \
+        --bucket "${S3_BUCKET}" \
+        --prefix "${CHAIN_ROOT}/${1}/" \
+        --delimiter "/" \
+        --endpoint-url "${S3_ENDPOINT}" \
+        --query 'CommonPrefixes[].Prefix' \
+        --output json |
+        jq -r '.[]' |
+        grep -c '/inc-' || true
 }
 
 # 删除旧的全量链目录，只保留最近的 KEEP_CHAINS 个
@@ -137,11 +150,16 @@ upload_parts() {
         fi
 
         # 上传该分片，失败自动重试；Openlist 限速后 read timeout 设 0 避免中断
+        # (显式判失败:本函数跑在 if 条件的管道里,set -e 不生效,必须自己中断)
         log "Uploading part ${part_file}"
-        retry aws s3 cp "${part_path}" "s3://${S3_BUCKET}/${CHAIN_ROOT}/${s3_subpath}/${part_file}" \
+        if ! retry aws s3 cp "${part_path}" "s3://${S3_BUCKET}/${CHAIN_ROOT}/${s3_subpath}/${part_file}" \
             --endpoint-url="${S3_ENDPOINT}" \
             --cli-read-timeout 0 \
-            --cli-connect-timeout 600
+            --cli-connect-timeout 600; then
+            rm -f "${part_path}"
+            rm -rf "${part_tmp_dir}"
+            return 1
+        fi
 
         rm -f "${part_path}"
         part_idx=$((part_idx + 1))
@@ -167,13 +185,21 @@ configure_aws_cli
 # ======= 快照与全量/增量判断 =======
 # 两种模式:
 #  A. 独立运行(默认):自建 ${SNAP_TAG:-pbs}-<ts> 快照,按本地快照计数定全量/增量
-#  B. manager 多目标:EXISTING_SNAPSHOT 复用共享快照(不建不删) +
-#     ANCHOR_BOOKMARK_PREFIX 按"源×目标"书签定节奏/作增量锚点(send -i 支持书签)
-#     + BACKUP_TS 统一时间戳 + SRC_TAG 链目录按源隔离
-TIMESTAMP="${BACKUP_TS:-$(date +%Y%m%d-%H%M%S)}"
-if [ -n "${EXISTING_SNAPSHOT:-}" ]; then
-    SNAPSHOT="$EXISTING_SNAPSHOT"
-    log "Reusing existing snapshot ${SNAPSHOT}"
+#  B. manager 多对多:注入 ANCHOR_SNAPSHOT=<源>@mgr-<目标> 固定锚点(每 源×目标 一个)。
+#     本次先建 <锚点>-new 快照:无锚点/无链→全量直发,否则 send -i 锚点 取增量;
+#     上传成功后 -new 改名接任锚点(旧锚点删),任一时刻每 源×目标 仅一份锚点快照。
+#  上传失败(两种模式相同):删除本次创建的快照和本次上传到 S3 的内容(不动既有链
+#  与旧锚点),日志记录后退出 1。
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+# 链根目录:多源共用同一 S3 前缀时按 SRC_TAG 隔离(独立运行为空,布局不变)
+CHAIN_ROOT="${S3_PREFIX}${SRC_TAG:+/${SRC_TAG}}"
+
+ANCHOR="${ANCHOR_SNAPSHOT:-}"
+if [ -n "$ANCHOR" ]; then
+    SNAPSHOT="${ANCHOR}-new"
+    zfs destroy "$SNAPSHOT" 2>/dev/null || true   # 上次失败/崩溃的残留
+    log "Creating snapshot ${SNAPSHOT} (anchor: ${ANCHOR})"
+    zfs snapshot "$SNAPSHOT"
 else
     SNAP_NAME="${SNAP_TAG:-pbs}-${TIMESTAMP}"
     SNAPSHOT="${ZVOL}@${SNAP_NAME}"
@@ -181,17 +207,19 @@ else
     zfs snapshot "${SNAPSHOT}"
 fi
 
-# 链根目录:多源共用同一 S3 前缀时按 SRC_TAG 隔离(独立运行为空,布局不变)
-CHAIN_ROOT="${S3_PREFIX}${SRC_TAG:+/${SRC_TAG}}"
-
 DO_FULL=0
-if [ -n "${ANCHOR_BOOKMARK_PREFIX:-}" ]; then
-    # B 模式:书签计数定节奏(0 或 FULL_EVERY 倍数→全量),最新书签为增量锚点
-    ALL_BMS=$(zfs list -t bookmark -H -o name -s creation \
-        | grep "^${ZVOL}#${ANCHOR_BOOKMARK_PREFIX}-" || true)
-    BM_COUNT=$(echo "$ALL_BMS" | grep -c "^${ZVOL}#${ANCHOR_BOOKMARK_PREFIX}-" || true)
-    [ $((BM_COUNT % FULL_EVERY)) -eq 0 ] && DO_FULL=1
-    PREV_SNAP=$(echo "$ALL_BMS" | tail -n 1)
+if [ -n "$ANCHOR" ]; then
+    # B 模式:无锚点或无链→全量;否则链内每满 FULL_EVERY 次一次全量
+    CHAIN_FOLDER=$(current_s3_chain)
+    if ! zfs list "$ANCHOR" >/dev/null 2>&1; then
+        DO_FULL=1
+    elif [ -z "$CHAIN_FOLDER" ]; then
+        DO_FULL=1
+    else
+        INC_COUNT=$(count_chain_incs "$CHAIN_FOLDER")
+        [ $(( (INC_COUNT + 1) % FULL_EVERY )) -eq 0 ] && DO_FULL=1
+    fi
+    PREV_SNAP="$ANCHOR"
 else
     # A 模式:本地快照计数(原逻辑)
     ALL_SNAPS=$(zfs list -t snapshot -H -o name -s creation \
@@ -206,22 +234,44 @@ else
 fi
 
 if [ "$DO_FULL" -eq 1 ]; then
-    # 新全量：创建新链
     CHAIN_FOLDER="${TIMESTAMP}"
     S3_SUBPATH="${CHAIN_FOLDER}/full"
     PREV_SNAP=""
+    THIS_RUN_S3PATH="${CHAIN_FOLDER}"
     log "Full backup: s3://${S3_BUCKET}/${CHAIN_ROOT}/${S3_SUBPATH}/"
-    upload_stream "${SNAPSHOT}" "" "${S3_SUBPATH}"
 else
-    # 增量：放入当前最新的全量链
-    CHAIN_FOLDER=$(current_s3_chain)
+    CHAIN_FOLDER="${CHAIN_FOLDER:-$(current_s3_chain)}"
     if [ -z "$CHAIN_FOLDER" ]; then
         log "ERROR: no existing full backup chain found, cannot do incremental"
+        zfs destroy "$SNAPSHOT" && log "Deleted this run's snapshot ${SNAPSHOT}"
         exit 1
     fi
     S3_SUBPATH="${CHAIN_FOLDER}/inc-${TIMESTAMP}"
+    THIS_RUN_S3PATH="${S3_SUBPATH}"
     log "Incremental backup: ${PREV_SNAP} -> ${SNAPSHOT} into chain ${CHAIN_FOLDER}"
-    upload_stream "${SNAPSHOT}" "${PREV_SNAP}" "${S3_SUBPATH}"
+fi
+
+# 上传失败清理:删本次 S3 内容与本次快照(不动既有链与旧锚点)
+fail_this_run() {
+    log "ERROR: upload failed; deleting this run's S3 content and snapshot"
+    if retry aws s3 rm "s3://${S3_BUCKET}/${CHAIN_ROOT}/${THIS_RUN_S3PATH}/" \
+            --recursive --endpoint-url="${S3_ENDPOINT}"; then
+        log "Deleted this run's S3 content: ${CHAIN_ROOT}/${THIS_RUN_S3PATH}/"
+    else
+        log "WARN: S3 cleanup incomplete, please remove s3://${S3_BUCKET}/${CHAIN_ROOT}/${THIS_RUN_S3PATH}/ manually"
+    fi
+    if zfs destroy "$SNAPSHOT"; then
+        log "Deleted this run's snapshot ${SNAPSHOT}"
+    else
+        log "WARN: failed deleting snapshot ${SNAPSHOT}, please destroy it manually"
+    fi
+    log "ERROR: backup failed (this run's artifacts cleaned up)"
+    exit 1
+}
+
+# 上传数据流
+if ! upload_stream "${SNAPSHOT}" "${PREV_SNAP}" "${S3_SUBPATH}"; then
+    fail_this_run
 fi
 
 log "Uploaded: s3://${S3_BUCKET}/${CHAIN_ROOT}/${S3_SUBPATH}/"
@@ -229,15 +279,16 @@ log "Uploaded: s3://${S3_BUCKET}/${CHAIN_ROOT}/${S3_SUBPATH}/"
 # 清理旧的全量链
 cleanup_old_s3_chains
 
-# 本地锚点维护:B 模式建"源×目标"书签并修剪(书签不占空间,快照可安全轮换);
-# A 模式且快照为自建时,按 KEEP_SNAPSHOTS 清理本地旧快照
-if [ -n "${ANCHOR_BOOKMARK_PREFIX:-}" ]; then
-    log "Creating anchor bookmark ${ZVOL}#${ANCHOR_BOOKMARK_PREFIX}-${TIMESTAMP}"
-    zfs bookmark "${SNAPSHOT}" "${ZVOL}#${ANCHOR_BOOKMARK_PREFIX}-${TIMESTAMP}"
-    zfs list -t bookmark -H -o name -s creation \
-        | grep "^${ZVOL}#${ANCHOR_BOOKMARK_PREFIX}-" \
-        | head -n -${KEEP_SNAPSHOTS} | xargs -r -n1 zfs destroy
-elif [ -z "${EXISTING_SNAPSHOT:-}" ]; then
+# 本地锚点/快照维护
+if [ -n "$ANCHOR" ]; then
+    # B 模式:新快照改名接任锚点(旧锚点删除;此后每 源×目标 仍只有一份锚点)
+    if zfs list "$ANCHOR" >/dev/null 2>&1; then
+        zfs destroy "$ANCHOR"
+    fi
+    zfs rename "$SNAPSHOT" "$ANCHOR"
+    log "Anchor snapshot updated: ${ANCHOR}"
+else
+    # A 模式:按 KEEP_SNAPSHOTS 清理本地旧快照
     log "Cleaning up local snapshots"
     echo "$ALL_SNAPS" | head -n -${KEEP_SNAPSHOTS} | xargs -r -n1 zfs destroy
 fi

@@ -4,19 +4,22 @@ set -euo pipefail
 # pbs-cold-manager.sh — 多源×多目标 备份/恢复管理包装器
 #
 # 配合 pbs-cold-manager.conf 使用(bash 语法,被 source):
-#   backup [目标...]   对每个 zfs 源:创建一份共享快照(mgr-<ts>),逐个调用
-#                      该源各目标配置的备份脚本(7z 或旧裸流),结束后轮换快照。
+#   backup [目标...]   逐 (源,目标) 调用该目标配置的备份脚本(7z 或旧裸流)。
 #                      单目标失败不阻断,结束汇总,任一失败整体退出码 1。
 #                      指定目标时只跑这些目标(每个源按其目标交集)。
 #   restore <目标> [源] 调用该目标配置的恢复脚本。目标配置了多个源时
 #                      必须指定源;只有一个源时可省略。
 #   list               列出各目标解析后的脚本/密钥/源/S3 配置。
 #
-# 全量/增量节奏与锚点:备份脚本在 manager 模式下以"源×目标"维度的
-# zfs 书签(mgr-<目标>-*)计数定全量/增量、以最新书签为 send -i 锚点;
-# 书签不占空间,共享快照可安全轮换。
+# 快照模型(脚本侧 B 模式,由 ANCHOR_SNAPSHOT 触发):
+#   每个 (源,目标) 一个固定锚点快照 <源>@mgr-<目标>;首次全量直发,
+#   之后 send -i 锚点 取增量;上传成功后新快照改名接任锚点。
+#   上传失败由脚本删除本次快照与本次 S3 内容(不动既有链与旧锚点)。
 #
-# 加密密钥:共享层 PASSPHRASE_FILE 为默认密钥,<目标>_PASSPHRASE_FILE 覆盖。
+# 密钥管理:conf 里 KEYS 注册表定义 密钥id → 密钥文件路径;每个 (源,目标)
+#   关系按 <目标>_<源slug>_KEY → <目标>_KEY → 共享 KEY(默认 default)
+#   三级查找 id,再映射到文件路径注入脚本。未定义 KEYS 时回退到
+#   PASSPHRASE_FILE 直配。
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CONF="${PBS_COLD_CONF:-$SCRIPT_DIR/pbs-cold-manager.conf}"
@@ -50,7 +53,6 @@ TARGETS=(${TARGETS[@]+"${TARGETS[@]}"})
 SOURCES=(${SOURCES[@]+"${SOURCES[@]}"})
 DEFAULT_BACKUP_SCRIPT="${DEFAULT_BACKUP_SCRIPT:-pbs-cold-backup-7z.sh}"
 DEFAULT_RESTORE_SCRIPT="${DEFAULT_RESTORE_SCRIPT:-pbs-cold-restore-7z.sh}"
-KEEP_SNAPSHOTS="${KEEP_SNAPSHOTS:-7}"
 
 # 源路径 → 变量名片段(/ 与 - 转 _)
 slugify() {
@@ -92,6 +94,40 @@ effective_var() {
         echo "${!tv}"
     else
         echo "${!2:-}"
+    fi
+}
+
+# 源×目标三级查找: <目标>_<源slug>_<变量> → <目标>_<变量> → 共享层
+rel_var() {
+    local tv="${1}_${2}_${3}"
+    if [ -n "${!tv:-}" ]; then
+        echo "${!tv}"
+    else
+        effective_var "$1" "$3"
+    fi
+}
+
+# 密钥解析:密钥 id 三级查找(<目标>_<源slug>_KEY → <目标>_KEY → 共享 KEY,
+# 默认 default),再经 KEYS 注册表映射到文件路径;
+# 未定义 KEYS 注册表时回退到 PASSPHRASE_FILE 直配。
+resolve_key() {
+    local t="$1" slug="$2" kid path
+    if declare -p KEYS >/dev/null 2>&1 && [ "${#KEYS[@]}" -gt 0 ]; then
+        kid=$(rel_var "$t" "$slug" KEY)
+        kid="${kid:-default}"
+        path="${KEYS[$kid]:-}"
+        if [ -z "$path" ]; then
+            log "ERROR: [$t@$slug] 密钥 id '$kid' 未在 KEYS 注册表中定义"
+            return 1
+        fi
+        echo "$path"
+    else
+        path=$(effective_var "$t" PASSPHRASE_FILE)
+        if [ -z "$path" ]; then
+            log "ERROR: [$t@$slug] 未配置密钥(KEYS 注册表或 PASSPHRASE_FILE)"
+            return 1
+        fi
+        echo "$path"
     fi
 }
 
@@ -163,10 +199,10 @@ case "$cmd" in
         for t in ${requested[@]+"${requested[@]}"}; do check_target "$t"; done
         [ ${#SOURCES[@]} -gt 0 ] || { log "ERROR: 配置中没有 SOURCES"; exit 1; }
 
-        RUN_TS="${BACKUP_TS:-$(date +%Y%m%d-%H%M%S)}"
         failed=()
         did=0
         for src in "${SOURCES[@]}"; do
+            slug=$(slugify "$src")
             # 本源目标列表 ∩ 请求子集
             run_list=()
             for t in $(src_targets "$src"); do
@@ -176,19 +212,7 @@ case "$cmd" in
             done
             [ ${#run_list[@]} -eq 0 ] && continue
 
-            # 一份共享快照供本源全部目标使用(不重复创建)
-            SNAP="${src}@mgr-${RUN_TS}"
             log "===== source: $src (targets: ${run_list[*]}) ====="
-            if ! zfs snapshot "$SNAP" 2>/dev/null; then
-                if zfs list "$SNAP" >/dev/null 2>&1; then
-                    log "Snapshot $SNAP already exists, reusing"
-                else
-                    log "ERROR: failed creating snapshot $SNAP"
-                    for t in "${run_list[@]}"; do failed+=("$t@$src"); done
-                    continue
-                fi
-            fi
-
             # 同一源下两目标 bucket/prefix 相同会写到同一链目录,互相覆盖
             declare -A seen_roots=()
             for t in "${run_list[@]}"; do
@@ -199,22 +223,17 @@ case "$cmd" in
                     continue
                 fi
                 seen_roots[$root]="$t"
+                keyfile=$(resolve_key "$t" "$slug") || { failed+=("$t@$src"); continue; }
                 did=$((did + 1))
                 if ! run_target "$t" backup \
                         "ZVOL=$src" \
-                        "EXISTING_SNAPSHOT=$SNAP" \
-                        "ANCHOR_BOOKMARK_PREFIX=mgr-$t" \
-                        "BACKUP_TS=$RUN_TS" \
-                        "SRC_TAG=$(slugify "$src")"; then
+                        "SRC_TAG=$slug" \
+                        "ANCHOR_SNAPSHOT=${src}@mgr-$t" \
+                        "PASSPHRASE_FILE=$keyfile"; then
                     log "ERROR: [$t@$src] backup failed, continuing"
                     failed+=("$t@$src")
                 fi
             done
-
-            # 轮换本源 manager 快照(书签锚点独立,不受快照删除影响)
-            zfs list -t snapshot -H -o name -s creation \
-                | grep "^${src}@mgr-" | head -n -"${KEEP_SNAPSHOTS}" \
-                | xargs -r -n1 zfs destroy
         done
 
         [ "$did" -eq 0 ] && { log "ERROR: 没有任何 (源,目标) 组合可执行"; exit 1; }
@@ -244,24 +263,32 @@ case "$cmd" in
             exit 1
         fi
         slug=$(slugify "$src")
+        keyfile=$(resolve_key "$t" "$slug") || exit 1
         # DEST_ZVOL 三级查找: <目标>_<源slug>_DEST_ZVOL → <目标>_DEST_ZVOL → 共享层
-        dzv="${t}_${slug}_DEST_ZVOL"
-        dz="${!dzv:-}"
-        [ -z "$dz" ] && dz=$(effective_var "$t" DEST_ZVOL)
+        dz=$(rel_var "$t" "$slug" DEST_ZVOL)
         log "===== restore: $t @ $src → ${dz:-默认DEST_ZVOL} ====="
-        run_target "$t" restore "SRC_TAG=$slug" "DEST_ZVOL=$dz"
+        run_target "$t" restore \
+            "SRC_TAG=$slug" \
+            "DEST_ZVOL=$dz" \
+            "PASSPHRASE_FILE=$keyfile"
         ;;
     list)
         for t in ${TARGETS[@]+"${TARGETS[@]}"}; do
             bv="${t}_BACKUP_SCRIPT"; rv="${t}_RESTORE_SCRIPT"
             bshow="${!bv:-$DEFAULT_BACKUP_SCRIPT}"; [ -z "${!bv:-}" ] && bshow="$bshow (默认)"
             rshow="${!rv:-$DEFAULT_RESTORE_SCRIPT}"; [ -z "${!rv:-}" ] && rshow="$rshow (默认)"
+            if declare -p KEYS >/dev/null 2>&1 && [ "${#KEYS[@]}" -gt 0 ]; then
+                kv="${t}_KEY"; kid="${!kv:-${KEY:-default}}"
+                kshow="${kid} → ${KEYS[$kid]:-未注册!}"
+            else
+                kshow="$(effective_var "$t" PASSPHRASE_FILE)"
+            fi
             printf '%s\n  backup : %s\n  restore: %s\n  s3     : %s/%s @ %s\n  key    : %s\n  sources: %s\n' \
                 "$t" "$bshow" "$rshow" \
                 "$(effective_var "$t" S3_BUCKET)" \
                 "$(effective_var "$t" S3_PREFIX)" \
                 "$(effective_var "$t" S3_ENDPOINT)" \
-                "$(effective_var "$t" PASSPHRASE_FILE)" \
+                "$kshow" \
                 "$(sources_for_target "$t" | tr '\n' ' ')"
         done
         ;;

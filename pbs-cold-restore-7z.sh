@@ -17,8 +17,8 @@ WEAK_PASS="${WEAK_PASS:-canon2024}"
 DEST_ZVOL="${DEST_ZVOL:-tank/pbs-restore}"
 DEST_SIZE="${DEST_SIZE:-1T}"
 RESTORE_TMP="${RESTORE_TMP:-/tank/pbs-cold-backup-tmp}"
-RETRY_ATTEMPTS=6
-RETRY_DELAY=5
+RETRY_ATTEMPTS="${RETRY_ATTEMPTS:-6}"
+RETRY_DELAY="${RETRY_DELAY:-5}"
 SEVENZ="${SEVENZ:-7zz}"
 # =======================
 
