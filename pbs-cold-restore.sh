@@ -1,12 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# ======= 配置区 =======
-S3_BUCKET="baidu-pbs"
-S3_PREFIX="pbs-cold-backup"
-S3_ENDPOINT="https://s3.openlist.example.com"
-PASSPHRASE_FILE="/etc/pbs-cold-backup/passphrase"
-DEST_ZVOL="tank/pbs-restore"
+# ======= 配置区(均可用同名环境变量覆盖;默认值与原硬编码一致) =======
+S3_BUCKET="${S3_BUCKET:-baidu-pbs}"
+S3_PREFIX="${S3_PREFIX:-pbs-cold-backup}"
+S3_ENDPOINT="${S3_ENDPOINT:-https://s3.openlist.example.com}"
+PASSPHRASE_FILE="${PASSPHRASE_FILE:-/etc/pbs-cold-backup/passphrase}"
+DEST_ZVOL="${DEST_ZVOL:-tank/pbs-restore}"
 RETRY_ATTEMPTS=6
 RETRY_DELAY=5
 # =======================

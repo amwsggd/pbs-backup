@@ -1,15 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
-# ======= 配置区 =======
-ZVOL="tank/pbs-datastore"
-S3_BUCKET="baidu-pbs"
-S3_PREFIX="pbs-cold-backup"
-S3_ENDPOINT="https://s3.openlist.example.com"
-PASSPHRASE_FILE="/etc/pbs-cold-backup/passphrase"
-PART_SIZE="1G"
-PART_FORMAT="x%05d.zfs.zst.gpg"
-TMP_DIR="/tank/pbs-cold-backup-tmp"
+# ======= 配置区(均可用同名环境变量覆盖;默认值与原硬编码一致) =======
+ZVOL="${ZVOL:-tank/pbs-datastore}"
+S3_BUCKET="${S3_BUCKET:-baidu-pbs}"
+S3_PREFIX="${S3_PREFIX:-pbs-cold-backup}"
+S3_ENDPOINT="${S3_ENDPOINT:-https://s3.openlist.example.com}"
+PASSPHRASE_FILE="${PASSPHRASE_FILE:-/etc/pbs-cold-backup/passphrase}"
+PART_SIZE="${PART_SIZE:-1G}"
+PART_FORMAT="${PART_FORMAT:-x%05d.zfs.zst.gpg}"
+TMP_DIR="${TMP_DIR:-/tank/pbs-cold-backup-tmp}"
 KEEP_SNAPSHOTS=7
 FULL_EVERY=7
 KEEP_CHAINS=3
@@ -165,14 +165,14 @@ upload_stream() {
 configure_aws_cli
 
 # 创建本地快照
-SNAP_NAME="pbs-$(date +%Y%m%d-%H%M%S)"
+SNAP_NAME="${SNAP_TAG:-pbs}-$(date +%Y%m%d-%H%M%S)"
 SNAPSHOT="${ZVOL}@${SNAP_NAME}"
 log "Creating snapshot ${SNAPSHOT}"
 zfs snapshot "${SNAPSHOT}"
 
 # 列出所有本地快照
-ALL_SNAPS=$(zfs list -t snapshot -H -o name -s creation | grep "^${ZVOL}@pbs-" || true)
-SNAP_COUNT=$(echo "$ALL_SNAPS" | grep -c "^${ZVOL}@pbs-" || true)
+ALL_SNAPS=$(zfs list -t snapshot -H -o name -s creation | grep "^${ZVOL}@${SNAP_TAG:-pbs}-" || true)
+SNAP_COUNT=$(echo "$ALL_SNAPS" | grep -c "^${ZVOL}@${SNAP_TAG:-pbs}-" || true)
 
 # 判断全量还是增量
 DO_FULL=0
@@ -183,7 +183,7 @@ elif [ $((SNAP_COUNT % FULL_EVERY)) -eq 0 ]; then
 fi
 
 # 时间戳用于文件夹名和文件名
-TIMESTAMP="${SNAP_NAME#pbs-}"
+TIMESTAMP="${SNAP_NAME#${SNAP_TAG:-pbs}-}"
 
 if [ "$DO_FULL" -eq 1 ]; then
     # 新全量：创建新链

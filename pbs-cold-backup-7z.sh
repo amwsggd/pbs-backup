@@ -305,14 +305,14 @@ mkdir -p "$TMP_DIR"
 configure_aws_cli
 
 # ======= 创建本地快照 =======
-SNAP_NAME="pbs-$(date +%Y%m%d-%H%M%S)"
+SNAP_NAME="${SNAP_TAG:-pbs}-$(date +%Y%m%d-%H%M%S)"
 SNAPSHOT="${ZVOL}@${SNAP_NAME}"
 log "Creating snapshot ${SNAPSHOT}"
 zfs snapshot "${SNAPSHOT}"
 
 # 列出所有本地快照
 ALL_SNAPS=$(zfs list -t snapshot -H -o name -s creation | grep "^${ZVOL}@pbs-" || true)
-SNAP_COUNT=$(echo "$ALL_SNAPS" | grep -c "^${ZVOL}@pbs-" || true)
+SNAP_COUNT=$(echo "$ALL_SNAPS" | grep -c "^${ZVOL}@${SNAP_TAG:-pbs}-" || true)
 
 # 判断全量还是增量
 DO_FULL=0
@@ -323,7 +323,7 @@ elif [ $((SNAP_COUNT % FULL_EVERY)) -eq 0 ]; then
 fi
 
 # 时间戳用于文件夹名和文件名
-TIMESTAMP="${SNAP_NAME#pbs-}"
+TIMESTAMP="${SNAP_NAME#${SNAP_TAG:-pbs}-}"
 
 if [ "$DO_FULL" -eq 1 ]; then
     CHAIN_FOLDER="${TIMESTAMP}"
