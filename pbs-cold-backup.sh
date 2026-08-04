@@ -72,6 +72,28 @@ count_chain_incs() {
         grep -c '/inc-' || true
 }
 
+# 链内最近一次备份对应的快照时间戳:有 inc 取最新 inc 的 ts,否则为链目录名(全量 ts)
+chain_base_ts() {
+    local latest
+    latest=$(aws s3api list-objects-v2 \
+        --bucket "${S3_BUCKET}" \
+        --prefix "${CHAIN_ROOT}/${1}/" \
+        --delimiter "/" \
+        --endpoint-url "${S3_ENDPOINT}" \
+        --query 'CommonPrefixes[].Prefix' \
+        --output json |
+        jq -r '.[]' |
+        sed 's#/$##' |
+        awk -F/ '{print $NF}' |
+        { grep '^inc-' || true; } |
+        sort | tail -n 1)
+    if [ -n "$latest" ]; then
+        echo "${latest#inc-}"
+    else
+        echo "$1"
+    fi
+}
+
 # 删除旧的全量链目录，只保留最近的 KEEP_CHAINS 个
 cleanup_old_s3_chains() {
     log "Cleaning up old S3 chains, keeping last ${KEEP_CHAINS}"
@@ -183,54 +205,65 @@ upload_stream() {
 configure_aws_cli
 
 # ======= 快照与全量/增量判断 =======
-# 两种模式:
-#  A. 独立运行(默认):自建 ${SNAP_TAG:-pbs}-<ts> 快照,按本地快照计数定全量/增量
-#  B. manager 多对多:注入 ANCHOR_SNAPSHOT=<源>@mgr-<目标> 固定锚点(每 源×目标 一个)。
-#     本次先建 <锚点>-new 快照:无锚点/无链→全量直发,否则 send -i 锚点 取增量;
-#     上传成功后 -new 改名接任锚点(旧锚点删),任一时刻每 源×目标 仅一份锚点快照。
-#  上传失败(两种模式相同):删除本次创建的快照和本次上传到 S3 的内容(不动既有链
-#  与旧锚点),日志记录后退出 1。
-TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+# 快照命名与旧版一致:<源>@${SNAP_TAG:-pbs}-<ts>。多目标时 manager 为同源各
+# 目标注入同一 BACKUP_TS → 同名快照已存在则复用(同源同轮不重复建)。
+# 全量/增量与增量基以 S3 链为准(链目录名=全量 ts,inc-<ts>=增量 ts,
+# 恰好对应快照名):无链→全量;链内 inc 满 FULL_EVERY→全量开新链;否则以链内
+# 最近条目对应快照为 send -i 增量基;基快照已被清理则回退全量。
+# 失败处理(EXIT trap 兜底,覆盖上传失败以外的异常退出):
+# 先保证本次创建的快照被删(本地操作必然完成),再尽力删本次 S3 内容
+# (全量=新链目录,增量=该 inc 目录);既有链与既有快照一律不动。
+TIMESTAMP="${BACKUP_TS:-$(date +%Y%m%d-%H%M%S)}"
 # 链根目录:多源共用同一 S3 前缀时按 SRC_TAG 隔离(独立运行为空,布局不变)
 CHAIN_ROOT="${S3_PREFIX}${SRC_TAG:+/${SRC_TAG}}"
 
-ANCHOR="${ANCHOR_SNAPSHOT:-}"
-if [ -n "$ANCHOR" ]; then
-    SNAPSHOT="${ANCHOR}-new"
-    zfs destroy "$SNAPSHOT" 2>/dev/null || true   # 上次失败/崩溃的残留
-    log "Creating snapshot ${SNAPSHOT} (anchor: ${ANCHOR})"
-    zfs snapshot "$SNAPSHOT"
+SNAPSHOT="${ZVOL}@${SNAP_TAG:-pbs}-${TIMESTAMP}"
+SNAPSHOT_NEW=0
+if zfs list "$SNAPSHOT" >/dev/null 2>&1; then
+    log "Reusing existing snapshot ${SNAPSHOT}"
 else
-    SNAP_NAME="${SNAP_TAG:-pbs}-${TIMESTAMP}"
-    SNAPSHOT="${ZVOL}@${SNAP_NAME}"
     log "Creating snapshot ${SNAPSHOT}"
     zfs snapshot "${SNAPSHOT}"
+    SNAPSHOT_NEW=1
 fi
 
+BACKUP_OK=0
+THIS_RUN_S3PATH=""
+cleanup_on_exit() {
+    [ "$BACKUP_OK" = 1 ] && return 0
+    if [ "$SNAPSHOT_NEW" = 1 ]; then
+        zfs destroy "$SNAPSHOT" 2>/dev/null && \
+            log "Deleted this run's snapshot ${SNAPSHOT}"
+    fi
+    if [ -n "$THIS_RUN_S3PATH" ]; then
+        if retry aws s3 rm "s3://${S3_BUCKET}/${CHAIN_ROOT}/${THIS_RUN_S3PATH}/" \
+                --recursive --endpoint-url="${S3_ENDPOINT}"; then
+            log "Deleted this run's S3 content: ${CHAIN_ROOT}/${THIS_RUN_S3PATH}/"
+        else
+            log "WARN: S3 cleanup incomplete, please remove s3://${S3_BUCKET}/${CHAIN_ROOT}/${THIS_RUN_S3PATH}/ manually"
+        fi
+    fi
+}
+trap cleanup_on_exit EXIT
+
+CHAIN_FOLDER=$(current_s3_chain)
 DO_FULL=0
-if [ -n "$ANCHOR" ]; then
-    # B 模式:无锚点或无链→全量;否则链内每满 FULL_EVERY 次一次全量
-    CHAIN_FOLDER=$(current_s3_chain)
-    if ! zfs list "$ANCHOR" >/dev/null 2>&1; then
-        DO_FULL=1
-    elif [ -z "$CHAIN_FOLDER" ]; then
-        DO_FULL=1
-    else
-        INC_COUNT=$(count_chain_incs "$CHAIN_FOLDER")
-        [ $(( (INC_COUNT + 1) % FULL_EVERY )) -eq 0 ] && DO_FULL=1
-    fi
-    PREV_SNAP="$ANCHOR"
+PREV_SNAP=""
+if [ -z "$CHAIN_FOLDER" ]; then
+    DO_FULL=1
 else
-    # A 模式:本地快照计数(原逻辑)
-    ALL_SNAPS=$(zfs list -t snapshot -H -o name -s creation \
-        | grep "^${ZVOL}@${SNAP_TAG:-pbs}-" || true)
-    SNAP_COUNT=$(echo "$ALL_SNAPS" | grep -c "^${ZVOL}@${SNAP_TAG:-pbs}-" || true)
-    if [ "$SNAP_COUNT" -le 1 ]; then
-        DO_FULL=1
-    elif [ $((SNAP_COUNT % FULL_EVERY)) -eq 0 ]; then
+    INC_COUNT=$(count_chain_incs "$CHAIN_FOLDER")
+    [ $(( (INC_COUNT + 1) % FULL_EVERY )) -eq 0 ] && DO_FULL=1
+    PREV_SNAP="${ZVOL}@${SNAP_TAG:-pbs}-$(chain_base_ts "$CHAIN_FOLDER")"
+    if [ "$DO_FULL" -eq 0 ] && [ "$PREV_SNAP" = "$SNAPSHOT" ]; then
+        log "Nothing to do: incremental base equals current snapshot (${SNAPSHOT})"
+        BACKUP_OK=1
+        exit 0
+    fi
+    if [ "$DO_FULL" -eq 0 ] && ! zfs list "$PREV_SNAP" >/dev/null 2>&1; then
+        log "WARN: base snapshot ${PREV_SNAP} no longer exists, falling back to full"
         DO_FULL=1
     fi
-    PREV_SNAP=$(echo "$ALL_SNAPS" | tail -n 2 | head -n 1)
 fi
 
 if [ "$DO_FULL" -eq 1 ]; then
@@ -240,57 +273,27 @@ if [ "$DO_FULL" -eq 1 ]; then
     THIS_RUN_S3PATH="${CHAIN_FOLDER}"
     log "Full backup: s3://${S3_BUCKET}/${CHAIN_ROOT}/${S3_SUBPATH}/"
 else
-    CHAIN_FOLDER="${CHAIN_FOLDER:-$(current_s3_chain)}"
-    if [ -z "$CHAIN_FOLDER" ]; then
-        log "ERROR: no existing full backup chain found, cannot do incremental"
-        zfs destroy "$SNAPSHOT" && log "Deleted this run's snapshot ${SNAPSHOT}"
-        exit 1
-    fi
     S3_SUBPATH="${CHAIN_FOLDER}/inc-${TIMESTAMP}"
     THIS_RUN_S3PATH="${S3_SUBPATH}"
     log "Incremental backup: ${PREV_SNAP} -> ${SNAPSHOT} into chain ${CHAIN_FOLDER}"
 fi
 
-# 上传失败清理:删本次 S3 内容与本次快照(不动既有链与旧锚点)
-fail_this_run() {
-    log "ERROR: upload failed; deleting this run's S3 content and snapshot"
-    if retry aws s3 rm "s3://${S3_BUCKET}/${CHAIN_ROOT}/${THIS_RUN_S3PATH}/" \
-            --recursive --endpoint-url="${S3_ENDPOINT}"; then
-        log "Deleted this run's S3 content: ${CHAIN_ROOT}/${THIS_RUN_S3PATH}/"
-    else
-        log "WARN: S3 cleanup incomplete, please remove s3://${S3_BUCKET}/${CHAIN_ROOT}/${THIS_RUN_S3PATH}/ manually"
-    fi
-    if zfs destroy "$SNAPSHOT"; then
-        log "Deleted this run's snapshot ${SNAPSHOT}"
-    else
-        log "WARN: failed deleting snapshot ${SNAPSHOT}, please destroy it manually"
-    fi
-    log "ERROR: backup failed (this run's artifacts cleaned up)"
-    exit 1
-}
-
 # 上传数据流
 if ! upload_stream "${SNAPSHOT}" "${PREV_SNAP}" "${S3_SUBPATH}"; then
-    fail_this_run
+    log "ERROR: upload failed; deleting this run's snapshot and S3 content"
+    exit 1
 fi
+BACKUP_OK=1
 
 log "Uploaded: s3://${S3_BUCKET}/${CHAIN_ROOT}/${S3_SUBPATH}/"
 
 # 清理旧的全量链
 cleanup_old_s3_chains
 
-# 本地锚点/快照维护
-if [ -n "$ANCHOR" ]; then
-    # B 模式:新快照改名接任锚点(旧锚点删除;此后每 源×目标 仍只有一份锚点)
-    if zfs list "$ANCHOR" >/dev/null 2>&1; then
-        zfs destroy "$ANCHOR"
-    fi
-    zfs rename "$SNAPSHOT" "$ANCHOR"
-    log "Anchor snapshot updated: ${ANCHOR}"
-else
-    # A 模式:按 KEEP_SNAPSHOTS 清理本地旧快照
-    log "Cleaning up local snapshots"
-    echo "$ALL_SNAPS" | head -n -${KEEP_SNAPSHOTS} | xargs -r -n1 zfs destroy
-fi
+# 本地快照修剪(与旧版一致,保留最近 KEEP_SNAPSHOTS 份)
+log "Cleaning up local snapshots"
+ALL_SNAPS=$(zfs list -t snapshot -H -o name -s creation \
+    | grep "^${ZVOL}@${SNAP_TAG:-pbs}-" || true)
+echo "$ALL_SNAPS" | head -n -${KEEP_SNAPSHOTS} | xargs -r -n1 zfs destroy
 
 log "Done"

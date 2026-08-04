@@ -5,16 +5,17 @@ set -euo pipefail
 #
 # 配合 pbs-cold-manager.conf 使用(bash 语法,被 source):
 #   backup [目标...]   逐 (源,目标) 调用该目标配置的备份脚本(7z 或旧裸流)。
+#                      同一源的各目标注入同一 BACKUP_TS → 同名快照
+#                      (源@pbs-<ts>,与旧版一致)被复用,不重复创建。
 #                      单目标失败不阻断,结束汇总,任一失败整体退出码 1。
 #                      指定目标时只跑这些目标(每个源按其目标交集)。
 #   restore <目标> [源] 调用该目标配置的恢复脚本。目标配置了多个源时
 #                      必须指定源;只有一个源时可省略。
 #   list               列出各目标解析后的脚本/密钥/源/S3 配置。
 #
-# 快照模型(脚本侧 B 模式,由 ANCHOR_SNAPSHOT 触发):
-#   每个 (源,目标) 一个固定锚点快照 <源>@mgr-<目标>;首次全量直发,
-#   之后 send -i 锚点 取增量;上传成功后新快照改名接任锚点。
-#   上传失败由脚本删除本次快照与本次 S3 内容(不动既有链与旧锚点)。
+# 全量/增量与增量基由脚本按 S3 链推导(链目录名/inc-<ts> 即快照 ts);
+# 上传失败由脚本删除本次创建的快照与本次 S3 内容(EXIT trap 兜底,
+# 快照优先保证删除),既有数据不动,日志记录清楚。
 #
 # 密钥管理:conf 里 KEYS 注册表定义 密钥id → 密钥文件路径;每个 (源,目标)
 #   关系按 <目标>_<源slug>_KEY → <目标>_KEY → 共享 KEY(默认 default)
@@ -201,6 +202,7 @@ case "$cmd" in
 
         failed=()
         did=0
+        RUN_TS=$(date +%Y%m%d-%H%M%S)
         for src in "${SOURCES[@]}"; do
             slug=$(slugify "$src")
             # 本源目标列表 ∩ 请求子集
@@ -225,10 +227,11 @@ case "$cmd" in
                 seen_roots[$root]="$t"
                 keyfile=$(resolve_key "$t" "$slug") || { failed+=("$t@$src"); continue; }
                 did=$((did + 1))
+                # 同一 BACKUP_TS → 同源各目标复用同名快照(首个目标创建)
                 if ! run_target "$t" backup \
                         "ZVOL=$src" \
                         "SRC_TAG=$slug" \
-                        "ANCHOR_SNAPSHOT=${src}@mgr-$t" \
+                        "BACKUP_TS=$RUN_TS" \
                         "PASSPHRASE_FILE=$keyfile"; then
                     log "ERROR: [$t@$src] backup failed, continuing"
                     failed+=("$t@$src")
