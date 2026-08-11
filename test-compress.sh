@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# test-compress.sh — ZFS 全量与增量归档恢复测试
+# test-compress.sh — ZFS 全量+增量备份自验证测试
 #
-# test-compress.sh — ZFS 全量与增量归档恢复测试
+# 覆盖发送、归档、切片、恢复和哈希比对流程
 #
 # 环境变量(均有默认):
 #   WORK=./zfs_test  POOLSZ=512M  CHUNK=20m  PASS='zfs-test-pass'
@@ -21,7 +21,7 @@ rm -rf "$WORK"; mkdir -p "$WORK"; WORK=$(cd "$WORK" && pwd)
 
 fail() { echo "❌ $1" >&2; exit 1; }
 
-# 备份数据流与 7z 分卷封装
+# 管道:数据流 → 归档 → 切片(模拟上传落盘)
 backup_pipe() { # $1=fmt $2=目标分片目录
   mkdir -p "$2"
   SEVENZ="$SEVENZ" bash "$DS" -f "$1" -p "$PASS" 2>"$2.pack.log" | split -b "$CHUNK" -d -a 4 - "$2/c_"
@@ -33,7 +33,7 @@ restore_pipe() { # $1=分片目录 $2=下游命令
 
 # ============ 模拟模式:不依赖 ZFS,验证全量+增量管道接线 ============
 if [ "$SIMULATE" -eq 1 ]; then
-  echo "== SIMULATE:验证 archive/split/recover 的全量+增量接线(无 ZFS) =="
+  echo "== SIMULATE:验证归档/切分/恢复的全量+增量接线(无 ZFS) =="
   head -c 20M /dev/urandom > "$WORK/full.stream"
   head -c 3M  /dev/urandom > "$WORK/inc1.stream"
   head -c 2M  /dev/urandom > "$WORK/inc2.stream"

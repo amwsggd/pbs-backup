@@ -187,7 +187,7 @@ run_target() {
     for var in "${!envmap[@]}"; do
         env_args+=("$var=${envmap[$var]}")
     done
-    log "[$t] $mode → $(basename "$script") (S3: ${envmap[S3_BUCKET]:-?}/${envmap[S3_PREFIX]:-?}${envmap[SRC_TAG]:+/${envmap[SRC_TAG]}})"
+    log "[$t] $mode → $(basename "$script") (S3: ${envmap[S3_BUCKET]:-?}/${envmap[S3_PREFIX]:-?})"
     env "${env_args[@]}" bash "$script"
 }
 
@@ -230,7 +230,6 @@ case "$cmd" in
                 # 同一 BACKUP_TS → 同源各目标复用同名快照(首个目标创建)
                 if ! run_target "$t" backup \
                         "ZVOL=$src" \
-                        "SRC_TAG=$slug" \
                         "BACKUP_TS=$RUN_TS" \
                         "PASSPHRASE_FILE=$keyfile"; then
                     log "ERROR: [$t@$src] backup failed, continuing"
@@ -271,7 +270,6 @@ case "$cmd" in
         dz=$(rel_var "$t" "$slug" DEST_ZVOL)
         log "===== restore: $t @ $src → ${dz:-默认DEST_ZVOL} ====="
         run_target "$t" restore \
-            "SRC_TAG=$slug" \
             "DEST_ZVOL=$dz" \
             "PASSPHRASE_FILE=$keyfile"
         ;;

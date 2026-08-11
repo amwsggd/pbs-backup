@@ -48,7 +48,7 @@ list_s3_chains() {
         --endpoint-url "${S3_ENDPOINT}" \
         --query 'CommonPrefixes[].Prefix' \
         --output json |
-        jq -r '.[]' |
+        jq -r '.[]?' |
         sed "s#^${CHAIN_ROOT}/##" |
         sed 's#/$##' |
         sort
@@ -68,7 +68,7 @@ count_chain_incs() {
         --endpoint-url "${S3_ENDPOINT}" \
         --query 'CommonPrefixes[].Prefix' \
         --output json |
-        jq -r '.[]' |
+        jq -r '.[]?' |
         grep -c '/inc-' || true
 }
 
@@ -82,7 +82,7 @@ chain_base_ts() {
         --endpoint-url "${S3_ENDPOINT}" \
         --query 'CommonPrefixes[].Prefix' \
         --output json |
-        jq -r '.[]' |
+        jq -r '.[]?' |
         sed 's#/$##' |
         awk -F/ '{print $NF}' |
         { grep '^inc-' || true; } |
@@ -215,7 +215,7 @@ configure_aws_cli
 # (全量=新链目录,增量=该 inc 目录);既有链与既有快照一律不动。
 TIMESTAMP="${BACKUP_TS:-$(date +%Y%m%d-%H%M%S)}"
 # 链根目录:多源共用同一 S3 前缀时按 SRC_TAG 隔离(独立运行为空,布局不变)
-CHAIN_ROOT="${S3_PREFIX}${SRC_TAG:+/${SRC_TAG}}"
+CHAIN_ROOT="${S3_PREFIX}"
 
 SNAPSHOT="${ZVOL}@${SNAP_TAG:-pbs}-${TIMESTAMP}"
 SNAPSHOT_NEW=0

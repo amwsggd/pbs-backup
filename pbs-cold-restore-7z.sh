@@ -3,7 +3,7 @@ set -euo pipefail
 
 # pbs-cold-restore-7z.sh — pbs-cold-backup-7z.sh 的配套恢复端
 #
-# 从 S3 逐卷读取 7z 包并还原加密备份流
+# 从 S3 逐卷下载 7z 包并按条目顺序还原密文流，再解密解压到 zfs receive。
 
 # ======= 配置区(均可用同名环境变量覆盖) =======
 S3_BUCKET="${S3_BUCKET:-baidu-pbs}"
@@ -11,7 +11,7 @@ S3_PREFIX="${S3_PREFIX:-pbs-cold-backup-7z}"
 S3_ENDPOINT="${S3_ENDPOINT:-https://s3.openlist.example.com}"
 PASSPHRASE_FILE="${PASSPHRASE_FILE:-/etc/pbs-cold-backup/passphrase}"
 
-# 7z 封装层口令，备份端和恢复端须保持一致
+# 7z 封装层口令，须与备份端保持一致
 WEAK_PASS="${WEAK_PASS:-canon2024}"
 
 DEST_ZVOL="${DEST_ZVOL:-tank/pbs-restore}"
@@ -44,7 +44,7 @@ retry() {
 }
 
 # 链根目录:多源共用同一 S3 前缀时按 SRC_TAG 隔离(独立运行为空,布局不变)
-CHAIN_ROOT="${S3_PREFIX}${SRC_TAG:+/${SRC_TAG}}"
+CHAIN_ROOT="${S3_PREFIX}"
 
 # 列出 S3 上的所有全量链根目录
 list_s3_chains() {
@@ -55,7 +55,7 @@ list_s3_chains() {
         --endpoint-url "${S3_ENDPOINT}" \
         --query 'CommonPrefixes[].Prefix' \
         --output json |
-        jq -r '.[]' |
+        jq -r '.[]?' |
         sed "s#^${CHAIN_ROOT}/##" |
         sed 's#/$##' |
         sort
@@ -71,7 +71,7 @@ list_volumes() {
         --endpoint-url="${S3_ENDPOINT}" \
         --query 'Contents[].Key' \
         --output json |
-        jq -r '.[]' |
+        jq -r '.[]?' |
         awk -F/ '{print $NF}' |
         grep -E '\.7z\.[0-9]+$' |
         awk -F. '{printf "%d\t%s\n", $NF, $0}' |
@@ -92,7 +92,7 @@ download_volume() {
         >/dev/null
 }
 
-# 从 S3 逐卷读取 7z 包并还原加密备份流
+# 按卷号顺序下载并将归档内容输出到 stdout
 stream_volumes() {
     local subpath="$1"
     local volumes="$2"
@@ -105,7 +105,7 @@ stream_volumes() {
             log "ERROR: failed downloading ${subpath}/${part}"
             return 1
         fi
-        # 分卷条目参数与容量校验
+        # 按归档条目顺序输出并拼接
         "$SEVENZ" x -so -p"${WEAK_PASS}" "$dest"
         rm -f "$dest"
     done
@@ -184,7 +184,7 @@ INCREMENTAL_DIRS=$(aws s3api list-objects-v2 \
     --endpoint-url="${S3_ENDPOINT}" \
     --query 'CommonPrefixes[].Prefix' \
     --output json |
-    jq -r '.[]' |
+    jq -r '.[]?' |
     sed 's#/$##' |
     awk -F/ '{print $NF}' |
     grep '^inc-' |

@@ -3,11 +3,11 @@ set -euo pipefail
 
 # pbs-cold-backup-7z.sh — PBS datastore 冷备份(7z 分卷版)
 #
-# 7z 封装层口令，备份端和恢复端须保持一致
+# 在 zstd+gpg 加密流外增加 7z 分卷封装，便于顺序上传和逐卷恢复。
 #
-# 7z 封装层口令，备份端和恢复端须保持一致
+# 数据流:zfs send → zstd → gpg → 7z 分卷 → S3
 #
-# 分卷条目参数与容量校验
+# 临时占用峰值约为 2×VOL_SIZE_MB，落盘内容均为密文。
 
 # ======= 配置区(均可用同名环境变量覆盖) =======
 ZVOL="${ZVOL:-tank/pbs-datastore}"
@@ -19,14 +19,14 @@ PASSPHRASE_FILE="${PASSPHRASE_FILE:-/etc/pbs-cold-backup/passphrase}"
 # 7z 封装层口令，备份端和恢复端须保持一致
 WEAK_PASS="${WEAK_PASS:-canon2024}"
 
-VOL_SIZE_MB="${VOL_SIZE_MB:-1024}"      # 归档参数
-# 分卷条目参数与容量校验
-CLIPS_PER_VOL="${CLIPS_PER_VOL:-}"      # 归档参数
+VOL_SIZE_MB="${VOL_SIZE_MB:-1024}"      # 每卷目标大小(MB)
+# 条目参数留空时自动推导，也可通过同名环境变量显式设置
+CLIPS_PER_VOL="${CLIPS_PER_VOL:-}"      # 每卷条目数
 CLIP_MIN_MB="${CLIP_MIN_MB:-}"
 CLIP_MAX_MB="${CLIP_MAX_MB:-}"
 TMP_DIR="${TMP_DIR:-/tank/pbs-cold-backup-tmp}"
 ENTRY_DIR="${ENTRY_DIR:-DCIM/100CANON}" # 包内目录
-# 7z 归档流程说明
+# 卷文件基名
 VOL_BASE="${VOL_BASE:-DCIM_$(date +%Y%m%d)}"
 
 KEEP_SNAPSHOTS="${KEEP_SNAPSHOTS:-7}"
@@ -35,13 +35,13 @@ KEEP_CHAINS="${KEEP_CHAINS:-3}"
 RETRY_ATTEMPTS="${RETRY_ATTEMPTS:-3}"
 RETRY_DELAY="${RETRY_DELAY:-5}"
 SEVENZ="${SEVENZ:-7zz}"
-HEADER_SEED="${HEADER_SEED:-640}"   # 当前容器开销估计
-PAD_SLACK="${PAD_SLACK:-128}"       # 卷尾预留空间
+HEADER_SEED="${HEADER_SEED:-640}"   # 首卷容器开销估计值(B)，后续按实测调整
+PAD_SLACK="${PAD_SLACK:-128}"       # 卷尾预留空间(B)
 
-CLIP_NAME_FORMAT='MVI_%05d.MOV'
-COMPRESS_FILE_NAME_FORMAT='%s.7z.%05d'
+CLIP_NAME_FORMAT=${CLIP_NAME_FORMAT:-'MVI_%05d.MOV'}
+COMPRESS_FILE_NAME_FORMAT=${COMPRESS_FILE_NAME_FORMAT:-'%s.7z.%05d'}
 
-# 为归档条目生成稳定的时间戳序列
+# 自动推导分卷条目参数
 if [ -z "$CLIPS_PER_VOL" ]; then
     CLIPS_PER_VOL=$(( (VOL_SIZE_MB + 80) / 160 ))
     [ "$CLIPS_PER_VOL" -lt 2 ] && CLIPS_PER_VOL=2
@@ -88,7 +88,7 @@ list_s3_chains() {
         --endpoint-url "${S3_ENDPOINT}" \
         --query 'CommonPrefixes[].Prefix' \
         --output json |
-        jq -r '.[]' |
+        jq -r '.[]?' |
         sed "s#^${CHAIN_ROOT}/##" |
         sed 's#/$##' |
         sort
@@ -108,7 +108,7 @@ count_chain_incs() {
         --endpoint-url "${S3_ENDPOINT}" \
         --query 'CommonPrefixes[].Prefix' \
         --output json |
-        jq -r '.[]' |
+        jq -r '.[]?' |
         grep -c '/inc-' || true
 }
 
@@ -122,7 +122,7 @@ chain_base_ts() {
         --endpoint-url "${S3_ENDPOINT}" \
         --query 'CommonPrefixes[].Prefix' \
         --output json |
-        jq -r '.[]' |
+        jq -r '.[]?' |
         sed 's#/$##' |
         awk -F/ '{print $NF}' |
         { grep '^inc-' || true; } |
@@ -176,7 +176,7 @@ compress_encrypt_stream() {
             --passphrase-file "${PASSPHRASE_FILE}" --batch --yes
 }
 
-# 分卷条目参数与容量校验
+# 估算发送流大小，仅用于日志
 estimate_stream_bytes() {
     local snapshot="$1"
     local prev_snapshot="${2:-}"
@@ -195,10 +195,10 @@ estimate_stream_bytes() {
 
 # 为归档条目生成稳定的时间戳序列
 SHOT_BASE=$(date -d "${VOL_BASE##*_} 10:00:00" +%s 2>/dev/null || echo 1754000000)
-clip_mtime() { echo $(( SHOT_BASE + ($1 - 1) * 317 )); }   # 归档参数
+clip_mtime() { echo $(( SHOT_BASE + ($1 - 1) * 317 )); }   # $1=条目全局序号(从1开始)
 dir_mtime()  { echo $(( SHOT_BASE - 86400 )); }
 
-# 分卷条目参数与容量校验
+# 生成本卷各条目的字节配额，总和为指定载荷
 gen_clip_quotas() { # $1=本卷载荷目标字节;输出空格分隔的字节数列表
     local total="$1" n="$CLIPS_PER_VOL"
     local lo=$((CLIP_MIN_MB * 1048576)) hi=$((CLIP_MAX_MB * 1048576))
@@ -206,7 +206,7 @@ gen_clip_quotas() { # $1=本卷载荷目标字节;输出空格分隔的字节数
     for i in $(seq 1 $((n - 1))); do
         rest=$((total - sum))
         remain=$((n - i))
-        # 分卷条目参数与容量校验
+        # 根据剩余条目的允许范围收紧当前取值
         lo2=$((rest - hi * remain)); [ "$lo2" -lt "$lo" ] && lo2=$lo
         hi2=$((rest - lo * remain)); [ "$hi2" -gt "$hi" ] && hi2=$hi
         lo_mb=$(( (lo2 + 1048575) / 1048576 ))
@@ -218,7 +218,7 @@ gen_clip_quotas() { # $1=本卷载荷目标字节;输出空格分隔的字节数
     printf '%d\n' "$((total - sum))"
 }
 
-# 分卷大小与容器开销处理
+# 从 stdin 精确读取指定字节数到目标文件
 cut_clip() { # $1=字节数 $2=目标文件
     local bytes="$1" dest="$2"
     local mb=$((bytes / 1048576)) rem=$((bytes % 1048576))
@@ -230,18 +230,18 @@ cut_clip() { # $1=字节数 $2=目标文件
     fi
 }
 
-# 分卷条目参数与容量校验
+# 将加密流按卷封装并逐卷上传
 pack_and_upload_volumes() {
     local s3_subpath="$1"
     local run_dir="$2"
     local vol_base="$3"
 
-    # 分卷条目参数与容量校验
+    # 校验条目大小范围，避免容器编码开销跨档变化
     if [ "$CLIP_MIN_MB" -lt 2 ] || [ "$CLIP_MAX_MB" -gt 255 ]; then
         log "ERROR: CLIP_MIN_MB/CLIP_MAX_MB 必须在 [2,255] 内(7z 长度编码同档要求)"
         return 1
     fi
-    # 分卷条目参数与容量校验
+    # 校验每卷目标载荷能由配置的条目范围组成
     local vol_target=$(( VOL_SIZE_MB * 1048576 ))
     if [ $((CLIP_MIN_MB * 1048576 * CLIPS_PER_VOL)) -gt "$vol_target" ] || \
        [ $((CLIP_MAX_MB * 1048576 * CLIPS_PER_VOL)) -lt "$vol_target" ]; then
@@ -255,7 +255,7 @@ pack_and_upload_volumes() {
     local hat=$HEADER_SEED   # 当前容器开销估计
 
     while [ "$eof" -eq 0 ]; do
-        # 分卷大小与容器开销处理
+        # 预留容器开销和卷尾余量后生成本卷配额
         local quotas
         quotas=$(gen_clip_quotas $(( vol_target - hat - PAD_SLACK )))
 
@@ -264,13 +264,13 @@ pack_and_upload_volumes() {
         touch -d "@$(dir_mtime)" "$stage_dir/${ENTRY_DIR}" "$stage_dir/${ENTRY_DIR%/*}"
 
         local vol_bytes=0 quota got_bytes
-        # 分卷大小与容器开销处理
+        # 按配额读取条目，短读表示到达流末尾
         for quota in $quotas; do
             local clip_name clip_path
             clip_name=$(printf $CLIP_NAME_FORMAT "$clip_idx")
             clip_path="$stage_dir/${ENTRY_DIR}/${clip_name}"
 
-            # 分卷条目参数与容量校验
+            # 区分正常短读和 I/O 错误
             if ! cut_clip "$quota" "$clip_path"; then
                 log "ERROR: failed while cutting clip ${clip_name}"
                 return 1
@@ -290,23 +290,23 @@ pack_and_upload_volumes() {
             [ "$eof" -eq 1 ] && break
         done
 
-        # 7z 归档流程说明
+        # 流结束且本卷没有数据时停止
         if [ "$vol_bytes" -eq 0 ] && [ "$eof" -eq 1 ]; then
             rm -rf "$stage_dir"
             break
         fi
 
-        # 分卷条目参数与容量校验
+        # 将本卷条目封装为带密码的 7z
         local vol_name
         vol_name=$(printf $COMPRESS_FILE_NAME_FORMAT "$vol_base" "$vol_idx")
         (cd "$stage_dir" && "$SEVENZ" a -t7z -mx=0 -mhe=on -p"${WEAK_PASS}" \
             "$run_dir/$vol_name" "$ENTRY_DIR" >/dev/null)
         rm -rf "$stage_dir"
 
-        # 分卷大小与容器开销处理
+        # 非末卷按目标大小补足，末卷保持实际大小
         local vol_size pad
         vol_size=$(stat -c%s "$run_dir/$vol_name")
-        hat=$(( vol_size - vol_bytes ))        # 当前容器开销估计
+        hat=$(( vol_size - vol_bytes ))        # 更新下一卷的容器开销估计
         if [ "$eof" -eq 0 ]; then
             pad=$(( vol_target - vol_size ))
             if [ "$pad" -gt 0 ]; then
@@ -356,7 +356,7 @@ configure_aws_cli
 # (全量=新链目录,增量=该 inc 目录);既有链与既有快照一律不动。
 TIMESTAMP="${BACKUP_TS:-$(date +%Y%m%d-%H%M%S)}"
 # 链根目录:多源共用同一 S3 前缀时按 SRC_TAG 隔离(独立运行为空,布局不变)
-CHAIN_ROOT="${S3_PREFIX}${SRC_TAG:+/${SRC_TAG}}"
+CHAIN_ROOT="${S3_PREFIX}"
 
 SNAPSHOT="${ZVOL}@${SNAP_TAG:-pbs}-${TIMESTAMP}"
 SNAPSHOT_NEW=0
@@ -421,7 +421,7 @@ else
     log "Incremental backup: ${PREV_SNAP} -> ${SNAPSHOT} into chain ${CHAIN_FOLDER}"
 fi
 
-# 分卷条目参数与容量校验
+# 估算并记录本次流量
 EST_BYTES=$(estimate_stream_bytes "$SNAPSHOT" "$PREV_SNAP")
 if [ "$EST_BYTES" -gt 0 ]; then
     log "Estimated stream: $((EST_BYTES / 1024 / 1024))M, ~$((EST_BYTES / VOL_SIZE_MB / 1024 / 1024 + 1)) volume(s)"

@@ -34,7 +34,7 @@ retry() {
 
 # 列出 S3 上的所有全量链根目录
 # 链根目录:多源共用同一 S3 前缀时按 SRC_TAG 隔离(独立运行为空,布局不变)
-CHAIN_ROOT="${S3_PREFIX}${SRC_TAG:+/${SRC_TAG}}"
+CHAIN_ROOT="${S3_PREFIX}"
 
 list_s3_chains() {
     aws s3api list-objects-v2 \
@@ -44,7 +44,7 @@ list_s3_chains() {
         --endpoint-url "${S3_ENDPOINT}" \
         --query 'CommonPrefixes[].Prefix' \
         --output json |
-        jq -r '.[]' |
+        jq -r '.[]?' |
         sed "s#^${CHAIN_ROOT}/##" |
         sed 's#/$##' |
         sort
@@ -60,7 +60,7 @@ list_parts() {
         --endpoint-url="${S3_ENDPOINT}" \
         --query 'Contents[].Key' \
         --output json |
-        jq -r '.[]' |
+        jq -r '.[]?' |
         awk -F/ '{print $NF}' |
         grep '\.zfs\.zst\.gpg$' |
         sort
@@ -160,7 +160,7 @@ INCREMENTAL_DIRS=$(aws s3api list-objects-v2 \
     --endpoint-url="${S3_ENDPOINT}" \
     --query 'CommonPrefixes[].Prefix' \
     --output json |
-    jq -r '.[]' |
+    jq -r '.[]?' |
     sed 's#/$##' |
     awk -F/ '{print $NF}' |
     grep '^inc-' |
